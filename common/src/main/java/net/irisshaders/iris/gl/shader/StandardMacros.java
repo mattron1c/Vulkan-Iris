@@ -39,6 +39,23 @@ public class StandardMacros {
 		defines.add(new StringPair(key, ""));
 	}
 
+	/**
+	 * Vulkan Iris: GL extension macros packs test for, limited to features the Vulkan backend actually provides on
+	 * every device it accepts (core in GLSL 4.60 / SPIR-V with the features DeviceSelector requires).
+	 * fp64 / bindless / NV-only extensions are deliberately absent.
+	 */
+	private static final Set<String> VULKAN_EXTENSION_DEFINES = Set.of(
+		"MC_GL_ARB_shader_image_load_store", "MC_GL_ARB_compute_shader", "MC_GL_ARB_shader_storage_buffer_object",
+		"MC_GL_ARB_gpu_shader5", "MC_GL_ARB_texture_gather", "MC_GL_ARB_shader_texture_lod", "MC_GL_ARB_explicit_attrib_location",
+		"MC_GL_ARB_separate_shader_objects", "MC_GL_ARB_shading_language_packing", "MC_GL_ARB_shader_bit_encoding",
+		"MC_GL_ARB_texture_query_levels", "MC_GL_ARB_shader_image_size", "MC_GL_ARB_derivative_control",
+		"MC_GL_ARB_shader_group_vote", "MC_GL_ARB_texture_rectangle", "MC_GL_EXT_gpu_shader4");
+
+	/** True when Minecraft renders through a Vulkan backend (Polydium / Mojang Vulkan), i.e. there is no GL context. */
+	public static boolean isVulkanBackend() {
+		return !String.valueOf(RenderSystem.getDevice().getBackendName()).toLowerCase(Locale.ROOT).contains("opengl");
+	}
+
 	private static void define(List<StringPair> defines, String key, String value) {
 		defines.add(new StringPair(key, value));
 	}
@@ -209,6 +226,8 @@ public class StandardMacros {
 	 * @see <a href="https://github.com/sp614x/optifine/blob/9c6a5b5326558ccc57c6490b66b3be3b2dc8cbef/OptiFineDoc/doc/shaders.txt#L705-L707">Optifine Doc for GLSL Version</a>
 	 */
 	public static String getGlVersion(int name) {
+		// Vulkan Iris: no GL context exists on a Vulkan backend. Packs are compiled through glslang/shaderc as GLSL 4.60.
+		if (isVulkanBackend()) return "460";
 		String info = GlStateManager._getString(name);
 
 		Matcher matcher = SEMVER_PATTERN.matcher(Objects.requireNonNull(info));
@@ -329,6 +348,7 @@ public class StandardMacros {
 	 * @see <a href="https://github.com/sp614x/optifine/blob/9c6a5b5326558ccc57c6490b66b3be3b2dc8cbef/OptiFineDoc/doc/shaders.txt#L735-L738">Optifine Doc</a>
 	 */
 	public static Set<String> getGlExtensions() {
+		if (isVulkanBackend()) return VULKAN_EXTENSION_DEFINES;
 		// In OpenGL Core, we must use a new way of retrieving extensions.
 		int numExtensions = GlStateManager._getInteger(GL30C.GL_NUM_EXTENSIONS);
 

@@ -692,6 +692,24 @@ public class Iris {
 		return irisConfig;
 	}
 
+	/**
+	 * Vulkan Iris: when Polydium runs on Vulkan it removes every {@code net.irisshaders.iris.*} mixin, so
+	 * {@link #onEarlyInitialize()} never runs. This sets up the state shader-pack loading needs (version, config)
+	 * without keybinds or GL. No-op if Iris already initialised normally.
+	 */
+	public static synchronized void initializeForVulkan() {
+		if (IRIS_VERSION == null) IRIS_VERSION = IrisPlatformHelpers.getInstance().getVersion();
+		if (irisConfig == null) {
+			irisConfig = new IrisConfig(IrisPlatformHelpers.getInstance().getConfigDir().resolve("iris.properties"),
+				IrisPlatformHelpers.getInstance().getConfigDir().resolve("iris-excluded.json"));
+			try {
+				irisConfig.initialize();
+			} catch (IOException e) {
+				logger.error("Failed to initialize Iris configuration for the Vulkan backend", e);
+			}
+		}
+	}
+
 	public static UpdateChecker getUpdateChecker() {
 		return updateChecker;
 	}

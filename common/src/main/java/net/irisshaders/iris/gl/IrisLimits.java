@@ -11,5 +11,7 @@ public class IrisLimits {
 	public static final int MAX_COLOR_BUFFERS = 32;
 
 
-	public static final boolean VK_CONFORMANCE = false;
+	// Vulkan Iris: turned on when shaders are built for the Vulkan backend (explicit in/out locations, required by SPIR-V).
+	// Set once at startup, before any pack loads, so TransformPatcher's cache never mixes both modes.
+	public static volatile boolean VK_CONFORMANCE = Boolean.getBoolean("vulkaniris.vkConformance");
 }

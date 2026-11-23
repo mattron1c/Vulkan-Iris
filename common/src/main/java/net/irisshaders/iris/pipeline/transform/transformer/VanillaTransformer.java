@@ -362,7 +362,8 @@ public class VanillaTransformer {
 			root.replaceReferenceExpressions(t, "gl_ModelViewMatrix",
 				"(iris_VIEW_SCALE * iris_transforms.ModelViewMat)");
 		} else {
-			root.rename("gl_ModelViewMatrix", "iris_transforms.ModelViewMat");
+			// Vulkan Iris: rename() rejects a dotted target ("Invalid identifier name"); replace the expression like the branches above
+			root.replaceReferenceExpressions(t, "gl_ModelViewMatrix", "iris_transforms.ModelViewMat");
 		}
 
 		root.rename("gl_ProjectionMatrix", "iris_ProjMat");

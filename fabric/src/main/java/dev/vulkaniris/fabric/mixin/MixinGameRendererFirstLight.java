@@ -2,6 +2,7 @@ package dev.vulkaniris.fabric.mixin;
 
 import dev.vulkaniris.fabric.FirstLight;
 import dev.vulkaniris.fabric.ResourceCheck;
+import dev.vulkaniris.fabric.PackCompileCheck;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;
@@ -19,5 +20,6 @@ public class MixinGameRendererFirstLight {
 	private void vulkaniris$firstLight(DeltaTracker deltaTracker, boolean renderLevel, CallbackInfo ci) {
 		FirstLight.afterGameRender();
 		ResourceCheck.afterGameRender();
+		PackCompileCheck.afterGameRender();
 	}
 }

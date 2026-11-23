@@ -179,3 +179,5 @@ fun registerProdSelfTest(name: String, flag: String) =
 registerProdSelfTest("prodFirstLight", "vulkaniris.firstlight.selftest")
 // gradlew :fabric:prodPhase4 — Phase 4 resource layer (Polydium's VMA, colortex, barriers, descriptors, resize) in-game
 registerProdSelfTest("prodPhase4", "vulkaniris.phase4.selftest")
+// gradlew :fabric:prodPhase5 — every pack in fabric/run-prod/shaderpacks: Iris patcher → Vulkan GLSL → SPIR-V → driver
+registerProdSelfTest("prodPhase5", "vulkaniris.phase5.selftest")
