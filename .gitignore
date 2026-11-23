@@ -44,3 +44,8 @@ run/
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# Vulkan Iris: third-party jars copied from the user's own install (PolyForm Shield etc. — never commit or bundle)
+/run-deps/**/*.jar
+/fabric/run-prod/
+/vulkan/build/

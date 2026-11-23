@@ -30,7 +30,7 @@ public class IrisFabricHelpers implements IrisPlatformHelpers {
 
 	@Override
 	public String getVersion() {
-		return FabricLoader.getInstance().getModContainer("iris").get().getMetadata().getVersion().getFriendlyString();
+		return FabricLoader.getInstance().getModContainer("vulkaniris").get().getMetadata().getVersion().getFriendlyString();
 	}
 
 	@Override

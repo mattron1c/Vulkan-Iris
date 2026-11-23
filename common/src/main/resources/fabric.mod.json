@@ -1,9 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "iris",
+  "id": "vulkaniris",
+  "provides": ["iris"],
   "version": "${version}",
-  "name": "Iris",
-  "description": "A modern shaders mod for Minecraft intended to be compatible with existing OptiFine shader packs",
+  "name": "Vulkan Iris",
+  "description": "Unofficial fork of Iris Shaders working towards a native Vulkan backend. Based on Iris by coderbot, IMS212 and contributors.",
   "authors": [
     "coderbot",
     "IMS212",
@@ -19,6 +20,9 @@
   "icon": "assets/iris/textures/gui/iris-logo.png",
   "environment": "client",
   "entrypoints": {
+    "client": [
+      "dev.vulkaniris.fabric.VulkanIrisClient"
+    ],
     "modmenu": [
       "net.irisshaders.iris.compat.modmenu.ModMenuIntegration"
     ],
@@ -34,7 +38,8 @@
     "mixins.iris.bettermipmaps.json",
     "mixins.iris.compat.sodium.json",
     "mixins.iris.compat.dh.json",
-    "mixins.iris.fixes.maxfpscrash.json"
+    "mixins.iris.fixes.maxfpscrash.json",
+    "mixins.vulkaniris.fabric.json"
   ],
   "accessWidener": "iris.accesswidener",
   "depends": {

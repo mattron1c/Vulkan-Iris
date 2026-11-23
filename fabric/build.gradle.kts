@@ -1,7 +1,7 @@
 plugins {
     id("java")
     id("idea")
-    id("fabric-loom") version("1.16.3")
+    id("fabric-loom") version("1.19.4")
 }
 
 val MINECRAFT_VERSION: String by rootProject.extra
@@ -76,6 +76,27 @@ dependencies {
     implementation(project.project(":common").sourceSets.getByName("main").output)
 
     compileOnly(files(rootDir.resolve("DHApi.jar")))
+
+    // ---- Vulkan Iris ------------------------------------------------------------------------------------------
+    // Vulkan core (dev.vulkaniris.vk) + the LWJGL modules Minecraft doesn't ship. Same 3.3.3 builds VulkanMod and
+    // Polydium bundle, so jar-in-jar resolution loads a single copy whichever mods are installed.
+    implementation(project(":vulkan"))
+    include(project(":vulkan"))
+    include("org.lwjgl:lwjgl-vulkan:3.3.3")
+    for (module in listOf("shaderc", "vma")) {
+        include("org.lwjgl:lwjgl-$module:3.3.3")
+        for (os in listOf("windows", "windows-arm64", "linux", "macos", "macos-arm64")) {
+            include("org.lwjgl:lwjgl-$module:3.3.3:natives-$os")
+        }
+    }
+
+    // Polydium's Vulkan backport is used through its public classes at runtime only (PolyForm Shield: never copy
+    // its code, never bundle it). The jar comes from the user's own install, see run-deps/README.txt.
+    val polydiumDir = rootDir.resolve("run-deps/polydium")
+    modCompileOnly(files(polydiumDir.resolve("polydium-1.4.21+1.21.11.jar")))
+    if (project.hasProperty("polydium")) {
+        modLocalRuntime(fileTree(polydiumDir) { include("*.jar") })
+    }
 }
 
 tasks.named("compileTestJava").configure {
@@ -102,6 +123,9 @@ loom {
             configName = "Fabric Client"
             ideConfigGenerated(true)
             runDir("run")
+            // LWJGL's 64 KiB default stack overflows on large Vulkan drivers (VulkanMod uses 256 KiB too)
+            vmArg("-Dorg.lwjgl.system.stackSize=256")
+            if (project.hasProperty("firstlight")) vmArg("-Dvulkaniris.firstlight.selftest=true")
            // vmArgs("-Dmixin.debug.export=true")
            // vmArg("-XX:+AllowEnhancedClassRedefinition")
         }
@@ -137,3 +161,21 @@ tasks {
 
     remapJar.get().destinationDirectory = rootDir.resolve("build").resolve("libs")
 }
+
+// gradlew :fabric:prodFirstLight — launches a *production* Minecraft 1.21.11 (real mods folder, like a launcher)
+// with the built Vulkan Iris jar + Sodium + Polydium and its deps, and runs the Phase 3 first-light self-test.
+// Production layout is required: PolyCompose nests Compose UI two jar levels deep, which Loom's dev runtime
+// does not unpack.
+fun registerProdSelfTest(name: String, flag: String) =
+    tasks.register<net.fabricmc.loom.task.prod.ClientProductionRunTask>(name) {
+        group = "vulkan iris"
+        mods.from(tasks.named("remapJar"))
+        mods.from(SODIUM_DEPENDENCY_FABRIC)
+        mods.from(fileTree(rootDir.resolve("run-deps/polydium")) { include("*.jar") })
+        jvmArgs.addAll("-Dorg.lwjgl.system.stackSize=256", "-D$flag=true")
+        runDir.set(project.layout.projectDirectory.dir("run-prod"))
+    }
+
+registerProdSelfTest("prodFirstLight", "vulkaniris.firstlight.selftest")
+// gradlew :fabric:prodPhase4 — Phase 4 resource layer (Polydium's VMA, colortex, barriers, descriptors, resize) in-game
+registerProdSelfTest("prodPhase4", "vulkaniris.phase4.selftest")

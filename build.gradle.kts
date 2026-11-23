@@ -1,12 +1,12 @@
 
 plugins {
     id("java")
-    id("fabric-loom") version("1.16.3") apply(false)
+    id("fabric-loom") version("1.19.4") apply(false)
 }
 
 val MINECRAFT_VERSION by extra { "1.21.11" }
 val NEOFORGE_VERSION by extra { "21.11.5-beta" }
-val FABRIC_LOADER_VERSION by extra { "0.18.1" }
+val FABRIC_LOADER_VERSION by extra { "0.19.5" } // Vulkan Iris: OneConfig/Polydium need >= 0.19.5 in dev runs
 val FABRIC_API_VERSION by extra { "0.140.2+1.21.11" }
 
 val SODIUM_DEPENDENCY_FABRIC by extra { files(rootDir.resolve("custom_sodium/sodium-fabric-0.8.14+mc1.21.11.jar")) }
