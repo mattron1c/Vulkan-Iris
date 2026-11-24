@@ -185,3 +185,5 @@ registerProdSelfTest("prodPhase4", "vulkaniris.phase4.selftest")
 registerProdSelfTest("prodPhase5", "vulkaniris.phase5.selftest")
 // gradlew :fabric:prodPhase6 — each pack's begin/prepare/deferred/composite/final chain on Polydium's live frame, PNGs + report
 registerProdSelfTest("prodPhase6", "vulkaniris.phase6.selftest")
+// gradlew :fabric:prodPhase7 — Phase 6 test with terrain drawn by each pack's gbuffers_terrain/_cutout/_water programs
+registerProdSelfTest("prodPhase7", "vulkaniris.phase7.selftest")

@@ -7,14 +7,26 @@
   "compatibilityLevel": "JAVA_21",
   "client": [
     "GameRendererAccessorPort",
+    "GlBufferArenaAccessorPort",
+    "MixinAbstractBlockRenderContextPort",
     "MixinBiomeAmbientSoundsHandlerPort",
     "MixinBiomePort",
     "MixinBiomesPort",
+    "MixinBlockModelPartPort",
+    "MixinBlockRendererPort",
+    "MixinChunkMeshBuildTaskPort",
+    "MixinChunkVertexConsumerPort",
+    "MixinChunkVertexPort",
+    "MixinDefaultFluidRendererPort",
+    "MixinFluidRendererImplPort",
     "MixinFogRendererVulkan",
     "MixinGameRendererFirstLight",
     "MixinItemPort",
     "MixinLevelRendererVulkan",
-    "MixinLocalPlayerPort"
+    "MixinLocalPlayerPort",
+    "MixinRenderRegionArenasPort",
+    "MixinRenderSectionManagerPort",
+    "MixinSodiumVulkanPort"
   ],
   "injectors": {
     "defaultRequire": 1

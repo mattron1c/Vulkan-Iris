@@ -41,8 +41,21 @@ public final class GraphicsProgram implements AutoCloseable {
 		public static final Blend ALPHA = new Blend(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
 	}
 
+	/**
+	 * Depth, culling and push constants for geometry passes. {@link #NONE}: fullscreen passes (no depth, no culling).
+	 * {@code depthFormat} 0 = no depth attachment.
+	 */
+	public record Raster(int depthFormat, boolean depthTest, boolean depthWrite, int depthCompare, int cullMode, int frontFace,
+						 int pushConstantSize) {
+		public static final Raster NONE = new Raster(0, false, false, VK_COMPARE_OP_ALWAYS, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
+	}
+
 	public record Spec(String name, List<Stage> stages, List<byte[]> spirv, List<Binding> bindings, List<Attribute> attributes,
-					   int vertexStride, int topology, int[] colorFormats, Blend[] blends) {
+					   int vertexStride, int topology, int[] colorFormats, Blend[] blends, Raster raster) {
+		public Spec(String name, List<Stage> stages, List<byte[]> spirv, List<Binding> bindings, List<Attribute> attributes,
+					int vertexStride, int topology, int[] colorFormats, Blend[] blends) {
+			this(name, stages, spirv, bindings, attributes, vertexStride, topology, colorFormats, blends, Raster.NONE);
+		}
 	}
 
 	private final VkDevice device;
@@ -69,8 +82,13 @@ public final class GraphicsProgram implements AutoCloseable {
 			if (!spec.bindings().isEmpty()) dsl.pBindings(b);
 			VkCheck.check(vkCreateDescriptorSetLayout(device, dsl, null, lp), "vkCreateDescriptorSetLayout(" + spec.name() + ")");
 			sl = lp.get(0);
-			VkCheck.check(vkCreatePipelineLayout(device, VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(sl)), null, lp),
-				"vkCreatePipelineLayout(" + spec.name() + ")");
+			VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(sl));
+			if (spec.raster().pushConstantSize() > 0) {
+				VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack);
+				pcr.get(0).stageFlags(VK_SHADER_STAGE_ALL_GRAPHICS).offset(0).size(spec.raster().pushConstantSize());
+				plci.pPushConstantRanges(pcr);
+			}
+			VkCheck.check(vkCreatePipelineLayout(device, plci, null, lp), "vkCreatePipelineLayout(" + spec.name() + ")");
 			pl = lp.get(0);
 
 			VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(spec.stages().size(), stack);
@@ -110,17 +128,21 @@ public final class GraphicsProgram implements AutoCloseable {
 			}
 			VkPipelineColorBlendStateCreateInfo cb = VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default();
 			if (n > 0) cb.pAttachments(blend);
-			VkPipelineRenderingCreateInfo rendering = VkPipelineRenderingCreateInfo.calloc(stack).sType$Default().colorAttachmentCount(n);
+			Raster r = spec.raster();
+			VkPipelineRenderingCreateInfo rendering = VkPipelineRenderingCreateInfo.calloc(stack).sType$Default().colorAttachmentCount(n)
+				.depthAttachmentFormat(r.depthFormat());
 			if (n > 0) rendering.pColorAttachmentFormats(stack.ints(spec.colorFormats()));
+			if (hasStencil(r.depthFormat())) rendering.stencilAttachmentFormat(r.depthFormat());
 
 			VkGraphicsPipelineCreateInfo.Buffer gp = VkGraphicsPipelineCreateInfo.calloc(1, stack);
 			gp.get(0).sType$Default().pNext(rendering.address()).pStages(stages).pVertexInputState(vi)
 				.pInputAssemblyState(VkPipelineInputAssemblyStateCreateInfo.calloc(stack).sType$Default().topology(spec.topology()))
 				.pViewportState(VkPipelineViewportStateCreateInfo.calloc(stack).sType$Default().viewportCount(1).scissorCount(1))
 				.pRasterizationState(VkPipelineRasterizationStateCreateInfo.calloc(stack).sType$Default()
-					.polygonMode(VK_POLYGON_MODE_FILL).cullMode(VK_CULL_MODE_NONE).frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE).lineWidth(1f))
+					.polygonMode(VK_POLYGON_MODE_FILL).cullMode(r.cullMode()).frontFace(r.frontFace()).lineWidth(1f))
 				.pMultisampleState(VkPipelineMultisampleStateCreateInfo.calloc(stack).sType$Default().rasterizationSamples(VK_SAMPLE_COUNT_1_BIT))
-				.pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default())
+				.pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default()
+					.depthTestEnable(r.depthTest()).depthWriteEnable(r.depthWrite()).depthCompareOp(r.depthCompare()))
 				.pColorBlendState(cb)
 				.pDynamicState(VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR)))
 				.layout(pl);
@@ -138,6 +160,60 @@ public final class GraphicsProgram implements AutoCloseable {
 	}
 
 	public Spec spec() { return spec; }
+
+	private static boolean hasStencil(int format) {
+		return format == VK_FORMAT_D16_UNORM_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+	}
+
+	// ---- geometry recording: begin once, then many binds/draws, then end
+
+	/** Begins dynamic rendering into {@code colors} (+ optional {@code depth}), loading and storing their contents. */
+	public static void beginRendering(VkCommandBuffer cmd, GpuImage[] colors, GpuImage depth) {
+		GpuImage first = colors.length > 0 ? colors[0] : depth;
+		int w = first.width(), h = first.height();
+		try (MemoryStack stack = stackPush()) {
+			VkRenderingAttachmentInfo.Buffer color = VkRenderingAttachmentInfo.calloc(Math.max(1, colors.length), stack);
+			for (int i = 0; i < colors.length; i++) {
+				color.get(i).sType$Default().imageView(colors[i].view()).imageLayout(colors[i].layout())
+					.loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+			}
+			VkRenderingInfo info = VkRenderingInfo.calloc(stack).sType$Default().renderArea(a -> a.extent(e -> e.set(w, h))).layerCount(1);
+			if (colors.length > 0) info.pColorAttachments(color);
+			if (depth != null) {
+				VkRenderingAttachmentInfo d = VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(depth.view())
+					.imageLayout(depth.layout()).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+				info.pDepthAttachment(d);
+				if (hasStencil(depth.format())) info.pStencilAttachment(d);
+			}
+			if (cmd.getCapabilities().vkCmdBeginRendering != 0L) VK13.vkCmdBeginRendering(cmd, info);
+			else KHRDynamicRendering.vkCmdBeginRenderingKHR(cmd, info);
+			VkViewport.Buffer vp = VkViewport.calloc(1, stack);
+			vp.get(0).width(w).height(h).maxDepth(1f);
+			vkCmdSetViewport(cmd, 0, vp);
+			VkRect2D.Buffer sc = VkRect2D.calloc(1, stack);
+			sc.get(0).extent(e -> e.set(w, h));
+			vkCmdSetScissor(cmd, 0, sc);
+		}
+	}
+
+	public static void endRendering(VkCommandBuffer cmd) {
+		if (cmd.getCapabilities().vkCmdEndRendering != 0L) VK13.vkCmdEndRendering(cmd);
+		else KHRDynamicRendering.vkCmdEndRenderingKHR(cmd);
+	}
+
+	/** Binds this pipeline and its descriptor set (inside {@link #beginRendering}). */
+	public void bind(VkCommandBuffer cmd, long descriptorSet) {
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		if (descriptorSet != 0) {
+			try (MemoryStack stack = stackPush()) {
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, stack.longs(descriptorSet), null);
+			}
+		}
+	}
+
+	public void pushConstants(VkCommandBuffer cmd, ByteBuffer data) {
+		vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0, data);
+	}
 	public long setLayout() { return setLayout; }
 
 	/** Draws {@code vertexCount} vertices from {@code vertexBuffer} into {@code outputs} (all the same size), full viewport. */

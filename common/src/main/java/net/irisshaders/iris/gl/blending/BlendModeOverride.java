@@ -9,6 +9,11 @@ public class BlendModeOverride {
 		this.blendMode = blendMode;
 	}
 
+	/** Vulkan Iris: the override's blend mode, {@code null} = blending off. */
+	public BlendMode getBlendMode() {
+		return blendMode;
+	}
+
 	public static void restore() {
 		BlendModeStorage.restoreBlend();
 	}

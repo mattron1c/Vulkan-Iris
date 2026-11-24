@@ -18,9 +18,9 @@ renders the shadow maps. Once that works, packs render as they do on Iris and pe
   which supplies `mc_Entity`, `mc_midTexCoord`, `at_tangent` and the normals packs read.
 
 ## Slices (each one tested in-world with screenshots, like Phase 6)
-1. **7a: extended terrain vertices.** Port Iris's Sodium vertex-format mixins as `*Port` mixins, applied only on Polydium.
+1. **7a: extended terrain vertices.** *(done, see [PHASE7_STATUS.md](PHASE7_STATUS.md))* Port Iris's Sodium vertex-format mixins as `*Port` mixins, applied only on Polydium.
    They are CPU meshing code with no GL. Test: mesh a chunk, then decode block IDs and mid-texcoords from the vertex buffer.
-2. **7b: terrain gbuffers.** When a pack is active, wrap `SodiumVulkan.render` and draw the same multi-draw batches with
+2. **7b: terrain gbuffers.** *(done: 10 / 10 packs, see [PHASE7_STATUS.md](PHASE7_STATUS.md); it hooks `SodiumVulkan.draw`, not `render`)* When a pack is active, wrap `SodiumVulkan.render` and draw the same multi-draw batches with
    the pack's `gbuffers_terrain` / `_solid` / `_cutout` / `gbuffers_water` programs. Program fallbacks follow Iris's `ProgramId` chain.
    - Translation reuses Iris's `patchSodium` → `VulkanGlslTranslator`.
    - Output goes to the colortex MRT plus the main depth.

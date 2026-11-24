@@ -16,7 +16,19 @@ import dev.vulkaniris.vk.RenderTargetSet;
 import dev.vulkaniris.vk.SamplerCache;
 import dev.vulkaniris.vk.ShaderCompiler;
 import dev.vulkaniris.vk.VulkanContext;
+import net.caffeinemc.mods.sodium.client.render.chunk.vertex.format.ChunkMeshFormats;
+import net.caffeinemc.mods.sodium.client.render.chunk.vertex.format.ChunkVertexType;
+import net.caffeinemc.mods.sodium.client.render.chunk.vertex.format.impl.CompactChunkVertex;
+import net.irisshaders.iris.gl.blending.AlphaTest;
+import net.irisshaders.iris.gl.blending.AlphaTests;
+import net.irisshaders.iris.gl.blending.BlendMode;
+import net.irisshaders.iris.gl.blending.BlendModeOverride;
 import net.irisshaders.iris.gl.state.FogMode;
+import net.irisshaders.iris.shaderpack.programs.ProgramFallbackResolver;
+import net.irisshaders.iris.uniforms.builtin.BuiltinReplacementUniforms;
+import net.irisshaders.iris.vertices.sodium.terrain.FormatAnalyzer;
+import org.joml.Matrix3f;
+import org.joml.Matrix4f;
 import net.irisshaders.iris.gl.texture.InternalTextureFormat;
 import net.irisshaders.iris.pipeline.transform.PatchShaderType;
 import net.irisshaders.iris.pipeline.transform.ShaderResourceLayout;
@@ -134,7 +146,47 @@ final class PostChain implements AutoCloseable {
 	private record CustomImage(GpuImage image, boolean integer) implements Source {
 	}
 
+	/** Terrain programs: the block atlas (tex/texture/gtexture, and GL texture unit 0). */
+	private record Atlas() implements Source {
+	}
+
+	/** Terrain programs: the lightmap. */
+	private record Lightmap() implements Source {
+	}
+
+	/** Depth before translucent terrain: depthtex1/2 in composites, every depthtex in gbuffers (see notes). */
+	private record DepthNoTranslucent() implements Source {
+	}
+
+	/** Terrain programs: Sodium's per-region chunk fade block {@code iris_ChunkData}. */
+	private record ChunkData() implements Source {
+	}
+
 	private record Bound(int binding, Source source) {
+	}
+
+	/** One Sodium region's draw for a terrain pass (see {@link TerrainHook}). Buffers are Polydium's VkBuffers. */
+	record RegionDraw(int stride, long vertexBuffer, long indexBuffer, long chunkData, float offsetX, float offsetY, float offsetZ, int time,
+					  int[] count, int[] firstIndex, int[] baseVertex) {
+	}
+
+	/** Polydium's textures a terrain pass samples: the pass's block atlas and the lightmap. */
+	record TerrainInputs(GpuImage atlas, GpuImage lightmap) {
+	}
+
+	/** One of Iris's SodiumPrograms passes (TERRAIN, TERRAIN_CUTOUT, TRANSLUCENT). */
+	private static final class Gbuffer {
+		String name;
+		GraphicsProgram program;
+		ShaderResourceLayout layout;
+		List<Bound> bounds = new ArrayList<>();
+		int[] drawBuffers;
+		GpuBuffer ubo;
+		long stride;
+		final long[] slotSubmit = new long[SLOTS];
+		float alphaTest;
+		int regionOffset = -1, currentTime = -1, pushSize;
+		boolean usesSsbo;
 	}
 
 	/** One Iris compute program ({@code <pass>.csh}, {@code <pass>_a.csh} ...), dispatched before its pass. */
@@ -186,6 +238,16 @@ final class PostChain implements AutoCloseable {
 	private final ProgramSet set;
 	private final PackDirectives directives;
 	private final VulkanUniformWriter writer = new VulkanUniformWriter();
+	/** Uniforms for the terrain programs: Iris's SodiumShader set (PER_VERTEX fog, builtin replacements, Sodium matrices). */
+	private final VulkanUniformWriter gbufferWriter = new VulkanUniformWriter();
+	private static final ProgramId[] TERRAIN_IDS = {ProgramId.TerrainSolid, ProgramId.TerrainCutout, ProgramId.Water};
+	private final Gbuffer[] terrain = new Gbuffer[3];
+	private ChunkVertexType vertexFormat = ChunkMeshFormats.COMPACT;
+	private final int mainDepthFormat;
+	private final boolean withGbuffers;
+	private final DeferredDestroyer destroyer;
+	private boolean resolvingGbuffer;
+	private int atlasWidth = 1, atlasHeight = 1;
 	private final FrameUpdateNotifier notifier = new FrameUpdateNotifier();
 	private final CustomUniforms customUniforms;
 	private final Map<Stage, List<Pass>> passes = new LinkedHashMap<>();
@@ -208,6 +270,19 @@ final class PostChain implements AutoCloseable {
 
 	PostChain(VulkanContext ctx, GpuAllocator alloc, DeferredDestroyer destroyer, FrameClock clock, DescriptorRing ring, SamplerCache samplers,
 			  ShaderCompiler compiler, ProgramSet set, int mainColorFormat, int width, int height) {
+		this(ctx, alloc, destroyer, clock, ring, samplers, compiler, set, mainColorFormat, 0, width, height, false);
+	}
+
+	/**
+	 * {@code withGbuffers}: also build the pack's terrain programs (Phase 7). The caller must then route Polydium's terrain
+	 * draws to {@link #drawTerrain} and drive the frame with {@link #beginLevel} / {@link #beforeTranslucent} /
+	 * {@link #endLevel}, and rebuild chunks in {@link #vertexFormat()}.
+	 */
+	PostChain(VulkanContext ctx, GpuAllocator alloc, DeferredDestroyer destroyer, FrameClock clock, DescriptorRing ring, SamplerCache samplers,
+			  ShaderCompiler compiler, ProgramSet set, int mainColorFormat, int mainDepthFormat, int width, int height, boolean withGbuffers) {
+		this.mainDepthFormat = mainDepthFormat;
+		this.destroyer = destroyer;
+		this.withGbuffers = withGbuffers;
 		this.ctx = ctx;
 		this.alloc = alloc;
 		this.clock = clock;
@@ -236,6 +311,7 @@ final class PostChain implements AutoCloseable {
 			writer.override(glOnly, () -> new double[]{0, 0});
 		}
 		writer.attachCustom(customUniforms);
+		if (withGbuffers) setupGbufferUniforms();
 
 		Map<Integer, PackRenderTargetDirectives.RenderTargetSettings> settings = directives.getRenderTargetDirectives().getRenderTargetSettings();
 		for (int i = 0; i < targetFormats.length; i++) {
@@ -257,6 +333,7 @@ final class PostChain implements AutoCloseable {
 		Set<Integer> flippedOnce = new HashSet<>();
 		// Iris IrisRenderingPipeline: setup programs run once, before everything else
 		this.setup = buildComputes(compiler, set.getSetup(), TextureStage.SETUP, used, Set.of());
+		if (withGbuffers) buildTerrain(compiler, used);
 		for (Stage st : STAGES) {
 			flippedOnce = new HashSet<>(); // Iris: one CompositeRenderer per stage, each with its own flippedAtLeastOnce
 			List<Pass> list = new ArrayList<>();
@@ -352,7 +429,6 @@ final class PostChain implements AutoCloseable {
 			p.explicitFlips = d.getExplicitFlips();
 			for (int b : p.drawBuffers) used.add(b);
 		}
-		if (d.getBlendModeOverride().isPresent()) notes.add(p.name + ": blend override ignored (not implemented yet)");
 		if (d.getViewportScale() != null && d.getViewportScale().scale() != 1.0f) notes.add(p.name + ": viewport scale ignored (not implemented yet)");
 		if (!d.getMipmappedBuffers().isEmpty()) notes.add(p.name + ": mipmapped buffers sampled without mipmaps (not implemented yet)");
 
@@ -404,8 +480,24 @@ final class PostChain implements AutoCloseable {
 				colorFormats[i] = RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[p.drawBuffers[i]]));
 			}
 		}
+		// Iris CompositeRenderer: blending is off unless the program's blend directive (or a per-buffer one) turns it on
+		GraphicsProgram.Blend[] blends = new GraphicsProgram.Blend[colorFormats.length];
+		GraphicsProgram.Blend base = d.getBlendModeOverride().map(PostChain::blend).orElse(null);
+		Arrays.fill(blends, base);
+		if (!isFinal) {
+			for (var info : d.getBufferBlendOverrides()) {
+				for (int i = 0; i < p.drawBuffers.length; i++) {
+					if (p.drawBuffers[i] == info.index()) blends[i] = blend(new BlendModeOverride(info.blendMode()));
+				}
+			}
+		}
+		for (int i = 0; i < blends.length; i++) {
+			if (blends[i] != null && !isFinal && VkFormats.isInteger(targetFormats[p.drawBuffers[i]])) {
+				throw new IllegalStateException(p.name + ": blending into integer colortex" + p.drawBuffers[i] + " (Vulkan forbids it; GL ignores it)");
+			}
+		}
 		p.program = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec(p.name, stages, spirv, bindings, attributes, 20,
-			VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, colorFormats, null));
+			VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, colorFormats, blends));
 		if (p.layout.uniformBufferSize() > 0) {
 			p.stride = alignUp(p.layout.uniformBufferSize(), UBO_ALIGN);
 			p.ubo = buffer(p.name + " uniforms", p.stride * SLOTS, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -498,6 +590,230 @@ final class PostChain implements AutoCloseable {
 		return new Vector3i((int) Math.ceil(width / c.localSize[0]), (int) Math.ceil(height / c.localSize[1]), 1);
 	}
 
+	// ------------------------------------------------------------------ terrain gbuffers (Iris SodiumPrograms / SodiumShader)
+
+	private static double[] mat4(Matrix4f m) {
+		float[] f = m.get(new float[16]);
+		double[] d = new double[16];
+		for (int i = 0; i < 16; i++) d[i] = f[i];
+		return d;
+	}
+
+	/** Iris SodiumShader's uniforms, on top of the same common/custom ones the composite passes get. */
+	private void setupGbufferUniforms() {
+		var idMap = set.getPack().getIdMap();
+		CommonUniforms.addNonDynamicUniforms(gbufferWriter, idMap, directives, notifier);
+		CommonUniforms.addDynamicUniforms(gbufferWriter, FogMode.PER_VERTEX);
+		BuiltinReplacementUniforms.addBuiltinReplacementUniforms(gbufferWriter);
+		// GL state Vulkan doesn't have: the pass's blend state and bound texture. Reported in notes when a program uses them.
+		gbufferWriter.override("blendFunc", () -> new double[]{0, 0, 0, 0});
+		gbufferWriter.override("atlasSize", () -> new double[]{atlasWidth, atlasHeight});
+		gbufferWriter.override("gtextureSize", () -> new double[]{atlasWidth, atlasHeight});
+		gbufferWriter.override("gtextureId", () -> new double[]{0});
+		CapturedRenderingState s = CapturedRenderingState.INSTANCE;
+		gbufferWriter.override("iris_ModelViewMatrix", () -> mat4(new Matrix4f(s.getGbufferModelView())));
+		gbufferWriter.override("iris_ModelViewMatrixInverse", () -> mat4(new Matrix4f(s.getGbufferModelView()).invert()));
+		gbufferWriter.override("iris_ProjectionMatrix", () -> mat4(new Matrix4f(s.getGbufferProjection())));
+		gbufferWriter.override("iris_ProjectionMatrixInverse", () -> mat4(new Matrix4f(s.getGbufferProjection()).invert()));
+		gbufferWriter.override("iris_NormalMatrix", () -> {
+			Matrix3f n = new Matrix4f(s.getGbufferModelView()).invert().transpose3x3(new Matrix3f());
+			float[] f = n.get(new float[9]);
+			double[] d = new double[9];
+			for (int i = 0; i < 9; i++) d[i] = f[i];
+			return d;
+		});
+		// SodiumShader.setupState: undo Sodium's one-texel coordinate offset, shrunk by one sub-texel (5 bits of precision)
+		gbufferWriter.override("u_TexCoordShrink", () -> {
+			double subTexel = 1 << 5, offset = 1.0 / CompactChunkVertex.TEXTURE_MAX_VALUE;
+			return new double[]{offset - (1.0 / atlasWidth) / subTexel, offset - (1.0 / atlasHeight) / subTexel};
+		});
+		gbufferWriter.override("iris_TexelSize", () -> new double[]{1.0 / atlasWidth, 1.0 / atlasHeight});
+		gbufferWriter.attachCustom(customUniforms);
+	}
+
+	private static AlphaTest terrainAlpha(int kind, ProgramSource source) {
+		return source.getDirectives().getAlphaTestOverride().orElse(
+			kind == TerrainHook.TRANSLUCENT ? AlphaTests.NON_ZERO_ALPHA : kind == TerrainHook.CUTOUT ? AlphaTests.HALF_ALPHA : AlphaTest.ALWAYS);
+	}
+
+	/**
+	 * Iris SodiumPrograms: resolve gbuffers_terrain_solid / _cutout / gbuffers_water through Iris's fallback chain,
+	 * patch with patchSodium, then pick the chunk vertex format from the attributes the programs read
+	 * (FormatAnalyzer, as Iris does after linking).
+	 */
+	private void buildTerrain(ShaderCompiler compiler, Set<Integer> used) {
+		ProgramFallbackResolver resolver = new ProgramFallbackResolver(set);
+		ProgramSource[] sources = new ProgramSource[3];
+		VulkanGlslTranslator.Result[] vk = new VulkanGlslTranslator.Result[3];
+		AlphaTest[] alpha = new AlphaTest[3];
+		boolean blockId = false, normal = false, midUv = false, midBlock = false;
+		for (int k = 0; k < 3; k++) {
+			ProgramSource src = resolver.resolveNullable(TERRAIN_IDS[k]);
+			if (src == null || !src.isValid()) continue;
+			sources[k] = src;
+			if (src.getTessEvalSource().isPresent() || src.getTessControlSource().isPresent()) {
+				throw new IllegalStateException(src.getName() + ": tessellation in terrain programs (not implemented yet)");
+			}
+			alpha[k] = terrainAlpha(k, src);
+			Map<PatchShaderType, String> gl = TransformPatcher.patchSodium(src.getName(), src.getVertexSource().orElse(null),
+				src.getGeometrySource().orElse(null), null, null, src.getFragmentSource().orElse(null), alpha[k], directives.getTextureMap());
+			vk[k] = VulkanGlslTranslator.translate(gl, gbufferWriter::provides, List.of("u_RegionOffset", "iris_CurrentTime"));
+			var a = vk[k].attributes();
+			blockId |= a.containsKey("mc_Entity");
+			normal |= a.containsKey("iris_Normal");
+			midUv |= a.containsKey("mc_midTexCoord");
+			midBlock |= a.containsKey("at_midBlock");
+		}
+		boolean any = false, all = true;
+		for (ProgramSource s : sources) {
+			any |= s != null;
+			all &= s != null;
+		}
+		if (!any) {
+			notes.add("pack has no terrain programs: terrain is drawn by Polydium and copied into colortex0");
+			return;
+		}
+		if (!all) {
+			// Polydium's own terrain pipeline reads Sodium's compact 20-byte vertices, so it can't draw the passes the pack leaves out
+			throw new IllegalStateException("pack has terrain programs for some passes only (" + Arrays.toString(sources) + "); not implemented yet");
+		}
+		vertexFormat = FormatAnalyzer.createFormat(blockId, normal, midUv, midBlock);
+		int stride = vertexFormat.getVertexFormat().getStride();
+		// FormatAnalyzer's order: block id, normal, mid uv, mid block, 4 bytes each after Sodium's 20
+		int off = 20;
+		int blockIdOffset = blockId ? off : -1;
+		if (blockId) off += 4;
+		int normalOffset = normal ? off : -1;
+		if (normal) off += 4;
+		int midUvOffset = midUv ? off : -1;
+		if (midUv) off += 4;
+		int midBlockOffset = midBlock ? off : -1;
+		if (midBlock) off += 4;
+		if (off != stride) throw new IllegalStateException("vertex stride " + stride + " != " + off + " computed from FormatAnalyzer's layout");
+
+		for (int k = 0; k < 3; k++) {
+			ProgramSource src = sources[k];
+			Gbuffer g = new Gbuffer();
+			g.name = src.getName();
+			g.alphaTest = alpha[k].reference();
+			var d = src.getDirectives();
+			// Iris SodiumPrograms.createFramebuffer: unknown draw buffers = {0}
+			g.drawBuffers = d.hasUnknownDrawBuffers() ? new int[]{0} : d.getDrawBuffers();
+			for (int b : g.drawBuffers) used.add(b);
+			g.layout = vk[k].layout();
+			for (String u : gbufferWriter.unresolved(g.layout)) notes.add(g.name + ": uniform " + u + " has no Vulkan value yet (zero)");
+			for (String u : List.of("blendFunc")) if (g.layout.uniforms().containsKey(u)) notes.add(g.name + ": uniform " + u + " reads GL blend state; written as 0");
+			var push = vk[k].pushConstants();
+			if (push.containsKey("u_RegionOffset")) g.regionOffset = push.get("u_RegionOffset").offset();
+			if (push.containsKey("iris_CurrentTime")) g.currentTime = push.get("iris_CurrentTime").offset();
+			g.pushSize = vk[k].pushConstantSize();
+
+			List<GraphicsProgram.Stage> stages = new ArrayList<>();
+			List<byte[]> spirv = new ArrayList<>();
+			for (var e : vk[k].sources().entrySet()) {
+				stages.add(switch (e.getKey()) {
+					case VERTEX -> GraphicsProgram.Stage.VERTEX;
+					case GEOMETRY -> GraphicsProgram.Stage.GEOMETRY;
+					case FRAGMENT -> GraphicsProgram.Stage.FRAGMENT;
+					default -> throw new IllegalStateException(g.name + ": stage " + e.getKey() + " in a terrain program");
+				});
+				spirv.add(compiler.compile(g.name + e.getKey().extension, compilerStage(e.getKey()), e.getValue()));
+			}
+			List<GraphicsProgram.Attribute> attributes = new ArrayList<>();
+			for (var a : vk[k].attributes().entrySet()) {
+				int loc = a.getValue();
+				attributes.add(switch (a.getKey()) {
+					// Sodium's compact vertex (DefaultChunkMeshAttributes)
+					case "a_Position" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R32G32_UINT, 0);
+					case "a_Color" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R8G8B8A8_UNORM, 8);
+					case "a_TexCoord" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R16G16_UINT, 12);
+					case "a_LightAndData" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R8G8B8A8_UINT, 16);
+					// Iris's extended attributes (IrisChunkMeshAttributes)
+					case "mc_Entity" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R32_UINT, blockIdOffset);
+					case "iris_Normal" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R32_UINT, normalOffset);
+					case "mc_midTexCoord" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R16G16_USCALED, midUvOffset);
+					case "at_midBlock" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R8G8B8A8_SSCALED, midBlockOffset);
+					default -> throw new IllegalStateException(g.name + ": terrain program reads vertex attribute " + a.getKey() + ", which Sodium's chunk vertex doesn't have: "
+						+ vk[k].sources().get(PatchShaderType.VERTEX).lines().filter(l -> l.contains(a.getKey())).limit(6).toList());
+				});
+			}
+
+			resolvingGbuffer = true;
+			List<GraphicsProgram.Binding> bindings;
+			try {
+				bindings = bindResources(g.name, g.layout, TextureStage.GBUFFERS_AND_SHADOW, used, Set.of(), VK_SHADER_STAGE_ALL_GRAPHICS, g.bounds);
+			} finally {
+				resolvingGbuffer = false;
+			}
+			g.usesSsbo = g.bounds.stream().anyMatch(b -> b.source() instanceof Ssbo);
+
+			int[] colorFormats = new int[g.drawBuffers.length];
+			GraphicsProgram.Blend[] blends = new GraphicsProgram.Blend[g.drawBuffers.length];
+			// Sodium's translucent pass blends like vanilla's translucent terrain; solid and cutout don't blend
+			GraphicsProgram.Blend base = k == TerrainHook.TRANSLUCENT ? GraphicsProgram.Blend.ALPHA : null;
+			if (d.getBlendModeOverride().isPresent()) base = blend(d.getBlendModeOverride().get());
+			for (int i = 0; i < colorFormats.length; i++) {
+				colorFormats[i] = RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[g.drawBuffers[i]]));
+				blends[i] = base;
+			}
+			for (var info : d.getBufferBlendOverrides()) {
+				for (int i = 0; i < g.drawBuffers.length; i++) {
+					if (g.drawBuffers[i] == info.index()) blends[i] = blend(new BlendModeOverride(info.blendMode()));
+				}
+			}
+			if (d.getViewportScale() != null && d.getViewportScale().scale() != 1.0f) notes.add(g.name + ": viewport scale ignored (not implemented yet)");
+			// GL draws counter-clockwise front faces in GL window space; Polydium keeps GL's row order without a y flip,
+			// which mirrors the winding in Vulkan's framebuffer space, so GL's front faces are clockwise here
+			var raster = new GraphicsProgram.Raster(mainDepthFormat, true, true, VK_COMPARE_OP_LESS_OR_EQUAL, VK_CULL_MODE_BACK_BIT,
+				VK_FRONT_FACE_CLOCKWISE, g.pushSize);
+			g.program = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec(g.name, stages, spirv, bindings, attributes, stride,
+				VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, colorFormats, blends, raster));
+			if (g.layout.uniformBufferSize() > 0) {
+				g.stride = alignUp(g.layout.uniformBufferSize(), UBO_ALIGN);
+				g.ubo = buffer(g.name + " uniforms", g.stride * SLOTS, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+			}
+			Arrays.fill(g.slotSubmit, -1);
+			programCount++;
+			terrain[k] = g;
+		}
+		notes.add("terrain drawn with the pack's programs (" + terrain[0].name + ", " + terrain[1].name + ", " + terrain[2].name
+			+ "), vertex stride " + stride + "; entities, sky, hand, particles, clouds and weather are not drawn into the gbuffers yet (7c)");
+	}
+
+	/** Iris BlendModeOverride (GL blend factors) as a Vulkan blend; OFF = no blending. */
+	private static GraphicsProgram.Blend blend(BlendModeOverride o) {
+		BlendMode m = o.getBlendMode();
+		if (m == null) return null;
+		return new GraphicsProgram.Blend(glBlend(m.srcRgb()), glBlend(m.dstRgb()), glBlend(m.srcAlpha()), glBlend(m.dstAlpha()));
+	}
+
+	private static int glBlend(int gl) {
+		return switch (gl) {
+			case 0 -> VK_BLEND_FACTOR_ZERO;
+			case 1 -> VK_BLEND_FACTOR_ONE;
+			case 0x0300 -> VK_BLEND_FACTOR_SRC_COLOR;
+			case 0x0301 -> VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+			case 0x0302 -> VK_BLEND_FACTOR_SRC_ALPHA;
+			case 0x0303 -> VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+			case 0x0304 -> VK_BLEND_FACTOR_DST_ALPHA;
+			case 0x0305 -> VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+			case 0x0306 -> VK_BLEND_FACTOR_DST_COLOR;
+			case 0x0307 -> VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+			case 0x0308 -> VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+			default -> throw new IllegalStateException("GL blend factor 0x" + Integer.toHexString(gl) + " (not implemented yet)");
+		};
+	}
+
+	/** True when the pack's terrain programs were built: terrain must then be drawn through {@link #drawTerrain}. */
+	boolean hasTerrain() {
+		return terrain[0] != null;
+	}
+
+	/** The chunk vertex format the terrain programs need (Sodium's compact one if there are none). */
+	ChunkVertexType vertexFormat() {
+		return vertexFormat;
+	}
+
 	// ------------------------------------------------------------------ custom images (Iris GlImage)
 
 	private record ImageEntry(ImageInformation info, GpuImage image, boolean integer) {
@@ -566,7 +882,34 @@ final class PostChain implements AutoCloseable {
 		String n = d.name();
 		if (d.kind() == ShaderResourceLayout.Kind.UNIFORM_BUFFER) {
 			if (n.equals(ShaderResourceLayout.UNIFORM_BLOCK)) return new UniformBlock();
+			if (resolvingGbuffer && n.equals("iris_ChunkData")) return new ChunkData();
 			throw new IllegalStateException(pass + ": uniform block " + n + " (not implemented yet)");
+		}
+		if (resolvingGbuffer && d.kind() == ShaderResourceLayout.Kind.SAMPLER) {
+			// Iris addGbufferOrShadowSamplers (terrain): the atlas and lightmap are Polydium's own textures
+			switch (n) {
+				case "tex", "texture", "gtexture" -> {
+					return new Atlas();
+				}
+				case "lightmap" -> {
+					return new Lightmap();
+				}
+				case "normals" -> {
+					// Iris PBRTextureManager default when the resource pack has no _n maps: (127, 127, 255, 255)
+					notes.add(pass + ": normals = Iris's flat default normal (PBR atlases not loaded on Vulkan yet)");
+					return solid("default normals", 127 / 255f, 127 / 255f, 1f, 1f);
+				}
+				case "specular" -> {
+					notes.add(pass + ": specular = Iris's default (0) (PBR atlases not loaded on Vulkan yet)");
+					return solid("default specular", 0f, 0f, 0f, 0f);
+				}
+				case "depthtex0", "depthtex1", "depthtex2", "gdepthtex" -> {
+					notes.add(pass + ": " + n + " = depth before translucent terrain (GL would sample the depth buffer being drawn, a feedback loop)");
+					return new DepthNoTranslucent();
+				}
+				default -> {
+				}
+			}
 		}
 		if (d.kind() == ShaderResourceLayout.Kind.STORAGE_BUFFER) return ssbo(pass, d);
 		if (d.kind() == ShaderResourceLayout.Kind.IMAGE) {
@@ -582,6 +925,15 @@ final class PostChain implements AutoCloseable {
 		// Iris CustomTextureSamplerInterceptor: this stage's custom textures win over built-in names, except a colortex
 		// (or its legacy alias) that an earlier pass of the stage already wrote
 		int target = targetIndex(n);
+		if (resolvingGbuffer && target >= 0 && target < 4 && d.kind() == ShaderResourceLayout.Kind.SAMPLER) {
+			// Iris IrisSamplers.addRenderTargetSamplers: colortex0-3 can only be sampled in fullscreen passes, so in a gbuffer
+			// program the name stays unassigned and reads texture unit 0, the block atlas (unless a custom texture claims it)
+			var gbufferTextures = set.getPack().getCustomTextureDataMap().get(stage);
+			if (gbufferTextures == null || aliases(target).stream().noneMatch(gbufferTextures::containsKey)) {
+				notes.add(pass + ": " + n + " is not sampleable in gbuffers on Iris (colortex0-3); reads the block atlas like GL texture unit 0");
+				return new Atlas();
+			}
+		}
 		var perStage = set.getPack().getCustomTextureDataMap().get(stage);
 		if (perStage != null) {
 			List<String> names = target >= 0 ? aliases(target) : List.of(n);
@@ -600,6 +952,10 @@ final class PostChain implements AutoCloseable {
 				return new Depth();
 			}
 			case "depthtex1", "depthtex2" -> {
+				if (withGbuffers) {
+					if (n.equals("depthtex2")) notes.add("depthtex2 = depth before translucent terrain (the hand is not drawn into the gbuffers yet)");
+					return new DepthNoTranslucent();
+				}
 				notes.add(n + " = main depth (no separate pre-translucent / pre-hand copy yet)");
 				return new Depth();
 			}
@@ -621,6 +977,11 @@ final class PostChain implements AutoCloseable {
 		if (sampledImage != null) return sampledImage;
 		CustomTextureData custom = set.getPack().getIrisCustomTextureDataMap().get(n);
 		if (custom != null) return customTexture(pass, n, custom, d.type());
+		if (resolvingGbuffer && d.type().equalsIgnoreCase("sampler2D")) {
+			// GL: an unassigned sampler reads texture unit 0, which Iris's Sodium path binds to the block atlas
+			notes.add(pass + ": sampler " + n + " is unassigned in Iris; reads the block atlas like GL texture unit 0");
+			return new Atlas();
+		}
 		if (d.type().equalsIgnoreCase("sampler2D")) {
 			// GL: a sampler nobody assigned reads texture unit 0, which Iris's composite passes bind to colortex0
 			notes.add(pass + ": sampler " + n + " is unassigned in Iris; reads colortex0 like GL texture unit 0");
@@ -863,6 +1224,12 @@ final class PostChain implements AutoCloseable {
 		});
 	}
 
+	/** A 1x1 RGBA8 texture of one colour, nearest/clamp. */
+	private Source solid(String name, float r, float g, float b, float a) {
+		return fixedCache.computeIfAbsent("solid:" + name, k -> new Fixed(upload(name, 1, 1,
+			new byte[]{(byte) Math.round(r * 255), (byte) Math.round(g * 255), (byte) Math.round(b * 255), (byte) Math.round(a * 255)}), SamplerCache.NEAREST_CLAMP));
+	}
+
 	private GpuImage upload(String name, int w, int h, byte[] rgba) {
 		return uploadRaw(name, VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, false, rgba);
 	}
@@ -897,15 +1264,59 @@ final class PostChain implements AutoCloseable {
 	 * Returns false (recording nothing) if a uniform slot is still in use by an unfinished submission.
 	 */
 	boolean record(VkCommandBuffer cmd, LayoutTracker tracker, GpuImage mainColor, GpuImage mainDepth) {
+		if (!slotsFree()) return false;
+		beginLevel(cmd, tracker, mainColor, mainDepth, null);
+		beforeTranslucent(cmd, tracker);
+		endLevel(cmd, tracker);
+		return true;
+	}
+
+	private boolean slotsFree() {
 		for (List<Pass> list : passes.values()) for (Pass p : list) if (!slotFree(p)) return false;
 		if (finalPass != null && !slotFree(finalPass)) return false;
 		for (Compute c : setup) if (!slotFree(c.slotSubmit)) return false;
-		this.cmd = cmd;
-		this.tracker = tracker;
-		this.currentDepth = mainDepth;
+		for (Gbuffer g : terrain) if (g != null && !slotFree(g.slotSubmit)) return false;
+		return true;
+	}
+
+	/** With gbuffers a frame can't be skipped halfway: wait (rarely) for the uniform slot's earlier submission. */
+	private void awaitSlots() {
+		long deadline = System.nanoTime() + 5_000_000_000L;
+		while (!slotsFree()) {
+			if (System.nanoTime() > deadline) throw new IllegalStateException("uniform slot still in flight after 5 s");
+			Thread.onSpinWait();
+		}
+	}
+
+	private GpuImage mainColor, mainDepth, mainDepthAttachment, depthNoTranslucent;
+	private boolean levelBegun, translucentDone;
+	private TerrainInputs terrainInputs;
+	private static final SamplerCache.Key ATLAS_SAMPLER = new SamplerCache.Key(SamplerCache.Filter.NEAREST, SamplerCache.Address.REPEAT, true, false);
+
+	boolean levelBegun() {
+		return levelBegun;
+	}
+
+	boolean translucentDone() {
+		return translucentDone;
+	}
+
+	/**
+	 * Start of the world frame: uploads, uniforms, clears, setup, begin and prepare. {@code depthAttachment}: a view of
+	 * the main depth that covers all its aspects, for drawing terrain (null without gbuffers). Each of these calls records
+	 * into the frame command buffer between Polydium's passes; the caller puts Polydium's full barrier around each.
+	 */
+	void beginLevel(VkCommandBuffer cmd, LayoutTracker tracker, GpuImage mainColor, GpuImage mainDepth, GpuImage depthAttachment) {
+		if (levelBegun) throw new IllegalStateException("beginLevel twice in one frame");
+		if (hasTerrain()) awaitSlots();
+		this.mainColor = mainColor;
+		this.mainDepth = mainDepth;
+		this.mainDepthAttachment = depthAttachment;
+		levelBegun = true;
+		translucentDone = false;
+		segment(cmd, tracker);
 		targets.resize(mainColor.width(), mainColor.height());
-		LayoutTracker.releaseExternal(mainColor);
-		LayoutTracker.releaseExternal(mainDepth);
+		if (withGbuffers) ensureDepthCopy();
 		if (!uploads.isEmpty()) {
 			uploads.forEach(Runnable::run);
 			uploads.clear();
@@ -929,15 +1340,45 @@ final class PostChain implements AutoCloseable {
 		}
 		clearTargets();
 
+		// begin and prepare: everything before the gbuffers
 		for (var e : passes.entrySet()) {
-			directives.getExplicitFlips(e.getKey().preFlips()).forEach((b, flip) -> {
-				if (flip && targets.has(b)) targets.flip(b);
-			});
-			if (e.getKey().stage() == TextureStage.DEFERRED) {
-				copyScene(mainColor);
-				if (centerDepthProgram != null) sampleCenterDepth(mainDepth);
-			}
-			for (Pass p : e.getValue()) run(p, mainColor, mainDepth);
+			if (e.getKey().stage() == TextureStage.DEFERRED || e.getKey().stage() == TextureStage.COMPOSITE_AND_FINAL) continue;
+			runStage(e.getKey(), e.getValue());
+		}
+		endSegment();
+	}
+
+	private void runStage(Stage st, List<Pass> list) {
+		directives.getExplicitFlips(st.preFlips()).forEach((b, flip) -> {
+			if (flip && targets.has(b)) targets.flip(b);
+		});
+		for (Pass p : list) run(p, mainColor, mainDepth);
+	}
+
+	/**
+	 * After opaque terrain, before translucent terrain (Iris runs deferred there): depth copy for depthtex1, centre depth,
+	 * then the deferred stage. Without terrain programs the vanilla frame is first copied into colortex0.
+	 */
+	void beforeTranslucent(VkCommandBuffer cmd, LayoutTracker tracker) {
+		if (!levelBegun || translucentDone) throw new IllegalStateException("beforeTranslucent out of order");
+		segment(cmd, tracker);
+		translucentDone = true;
+		if (!hasTerrain()) copyScene(mainColor);
+		if (depthNoTranslucent != null) copyDepth(mainDepth, depthNoTranslucent);
+		if (centerDepthProgram != null) sampleCenterDepth(mainDepth);
+		for (var e : passes.entrySet()) {
+			if (e.getKey().stage() == TextureStage.DEFERRED) runStage(e.getKey(), e.getValue());
+		}
+		endSegment();
+	}
+
+	/** After the world: composite, final (into the main colour target) and Iris's copy-back. */
+	void endLevel(VkCommandBuffer cmd, LayoutTracker tracker) {
+		if (!levelBegun) throw new IllegalStateException("endLevel without beginLevel");
+		if (!translucentDone) beforeTranslucent(cmd, tracker);
+		segment(cmd, tracker);
+		for (var e : passes.entrySet()) {
+			if (e.getKey().stage() == TextureStage.COMPOSITE_AND_FINAL) runStage(e.getKey(), e.getValue());
 		}
 		if (finalPass != null) {
 			run(finalPass, mainColor, mainDepth);
@@ -946,9 +1387,150 @@ final class PostChain implements AutoCloseable {
 		}
 		copyBack();
 		frame++;
+		levelBegun = false;
+		endSegment();
+	}
+
+	private void segment(VkCommandBuffer cmd, LayoutTracker tracker) {
+		this.cmd = cmd;
+		this.tracker = tracker;
+		this.currentDepth = mainDepth;
+	}
+
+	/** Polydium owns the external images between segments: forget what the tracker knew about them. */
+	private void endSegment() {
+		LayoutTracker.releaseExternal(mainColor);
+		LayoutTracker.releaseExternal(mainDepth);
+		if (mainDepthAttachment != null) LayoutTracker.releaseExternal(mainDepthAttachment);
 		this.cmd = null;
 		this.tracker = null;
-		return true;
+	}
+
+	/** depthtex1: the depth buffer before translucent terrain (Iris copies it the same way, after opaque terrain). */
+	private void ensureDepthCopy() {
+		if (depthNoTranslucent != null && depthNoTranslucent.width() == mainDepth.width() && depthNoTranslucent.height() == mainDepth.height()) return;
+		if (depthNoTranslucent != null) {
+			GpuImage old = depthNoTranslucent;
+			ownedImages.remove(old);
+			destroyer.defer("depthtex1 copy", () -> alloc.destroy(old));
+		}
+		depthNoTranslucent = alloc.createImage("depthtex1 (no translucents)", mainDepth.format(), mainDepth.width(), mainDepth.height(),
+			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+		ownedImages.add(depthNoTranslucent);
+		clearDepth(depthNoTranslucent, 1f);
+	}
+
+	private void copyDepth(GpuImage src, GpuImage dst) {
+		tracker.use(src, LayoutTracker.Use.TRANSFER_SRC).use(dst, LayoutTracker.Use.TRANSFER_DST, true).flush(cmd);
+		try (MemoryStack s = MemoryStack.stackPush()) {
+			VkImageCopy.Buffer r = VkImageCopy.calloc(1, s);
+			r.get(0).srcSubresource(x -> x.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1))
+				.dstSubresource(x -> x.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).layerCount(1))
+				.extent(e -> e.set(src.width(), src.height(), 1));
+			vkCmdCopyImage(cmd, src.image(), src.layout(), dst.image(), dst.layout(), r);
+		}
+	}
+
+	private final ByteBuffer push = MemoryUtil.memAlloc(128);
+	private final Map<GpuImage, GpuImage> feedbackCopies = new IdentityHashMap<>();
+
+	/** A same-size, same-format copy target for a colortex image a gbuffer program samples while drawing into it. */
+	private GpuImage feedbackCopy(GpuImage src) {
+		GpuImage copy = feedbackCopies.get(src);
+		if (copy != null && copy.width() == src.width() && copy.height() == src.height()) return copy;
+		if (copy != null) {
+			GpuImage old = copy;
+			ownedImages.remove(old);
+			destroyer.defer("feedback copy", () -> alloc.destroy(old));
+		}
+		copy = alloc.createImage(src.name() + " (pre-pass copy)", src.format(), src.width(), src.height(),
+			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+		ownedImages.add(copy);
+		feedbackCopies.put(src, copy);
+		return copy;
+	}
+
+	private void copyColor(GpuImage src, GpuImage dst) {
+		tracker.use(src, LayoutTracker.Use.TRANSFER_SRC).use(dst, LayoutTracker.Use.TRANSFER_DST, true).flush(cmd);
+		try (MemoryStack s = MemoryStack.stackPush()) {
+			VkImageCopy.Buffer r = VkImageCopy.calloc(1, s);
+			r.get(0).srcSubresource(x -> x.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
+				.dstSubresource(x -> x.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1))
+				.extent(e -> e.set(src.width(), src.height(), 1));
+			vkCmdCopyImage(cmd, src.image(), src.layout(), dst.image(), dst.layout(), r);
+		}
+	}
+	private long staleRegions;
+
+	/** Region draws skipped because the region was still meshed in another vertex format. */
+	long staleRegions() {
+		return staleRegions;
+	}
+
+	/**
+	 * One Sodium terrain pass with the pack's program (Iris SodiumShader + Sodium's DefaultChunkRenderer draw loop):
+	 * one descriptor set per region (its chunk data differs), region offset and time as push constants, then the
+	 * region's batch as indexed draws. Writes go to the targets' current side, as Iris's gbuffer framebuffers do.
+	 */
+	void drawTerrain(VkCommandBuffer cmd, LayoutTracker tracker, int kind, List<RegionDraw> draws, TerrainInputs inputs) {
+		if (!levelBegun) throw new IllegalStateException("terrain drawn before beginLevel");
+		Gbuffer g = terrain[kind];
+		segment(cmd, tracker);
+		terrainInputs = inputs;
+		atlasWidth = inputs.atlas().width();
+		atlasHeight = inputs.atlas().height();
+		GpuImage[] outs = new GpuImage[g.drawBuffers.length];
+		for (int i = 0; i < outs.length; i++) outs[i] = targets.read(g.drawBuffers[i]);
+		Resolved r = new Resolved(g.bounds, mainDepth);
+		for (GpuImage o : outs) {
+			if (r.storage.contains(o)) throw new IllegalStateException(g.name + " uses " + o.name() + " as a storage image and renders to it (not implemented)");
+			if (r.sampled.contains(o)) {
+				// GL feedback loop (the program samples the colortex it draws into). In practice GL returns what the buffer
+				// held before the draw, except for texels the same draw already wrote; Vulkan forbids it outright, so the
+				// program samples a copy taken just before the pass instead
+				GpuImage copy = feedbackCopy(o);
+				copyColor(o, copy);
+				r.replace(o, copy);
+				notes.add(g.name + ": samples " + o.name() + " while drawing into it (GL feedback loop); reads a copy taken before the pass");
+			}
+		}
+		r.declare(LayoutTracker.Use.SAMPLED_GRAPHICS, LayoutTracker.Use.STORAGE_FRAGMENT);
+		for (GpuImage o : outs) tracker.use(o, LayoutTracker.Use.COLOR_ATTACHMENT);
+		tracker.use(mainDepthAttachment, LayoutTracker.Use.DEPTH_ATTACHMENT);
+		tracker.flush(cmd);
+		if (g.usesSsbo) memoryBarrier();
+
+		int slot = (int) (frame % SLOTS);
+		g.slotSubmit[slot] = clock.currentIndex();
+		CapturedRenderingState.INSTANCE.setCurrentAlphaTest(g.alphaTest);
+		boolean fill = true;
+		GraphicsProgram.beginRendering(cmd, outs, mainDepthAttachment);
+		try (MemoryStack s = MemoryStack.stackPush()) {
+			int stride = g.program.spec().vertexStride();
+			for (RegionDraw d : draws) {
+				// a region meshed before the switch to the pack's format (chunks rebuild over a few frames): its vertices
+				// have another stride and drawing them would read past its buffer, so it is skipped until rebuilt
+				if (d.stride() != stride) {
+					staleRegions++;
+					continue;
+				}
+				long ds = ring.allocate(g.program.setLayout());
+				r.write(ds, g.bounds, g.layout, g.ubo, g.stride, slot, gbufferWriter, fill, d.chunkData());
+				fill = false;
+				g.program.bind(cmd, ds);
+				if (g.pushSize > 0) {
+					for (int i = 0; i < g.pushSize; i++) push.put(i, (byte) 0);
+					if (g.regionOffset >= 0) push.putFloat(g.regionOffset, d.offsetX()).putFloat(g.regionOffset + 4, d.offsetY()).putFloat(g.regionOffset + 8, d.offsetZ());
+					if (g.currentTime >= 0) push.putInt(g.currentTime, d.time());
+					g.program.pushConstants(cmd, push.slice(0, g.pushSize));
+				}
+				vkCmdBindVertexBuffers(cmd, 0, s.longs(d.vertexBuffer()), s.longs(0));
+				vkCmdBindIndexBuffer(cmd, d.indexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+				for (int i = 0; i < d.count().length; i++) vkCmdDrawIndexed(cmd, d.count()[i], 1, d.firstIndex()[i], d.baseVertex()[i], 0);
+			}
+		}
+		GraphicsProgram.endRendering(cmd);
+		endSegment();
 	}
 
 	private boolean slotFree(Pass p) {
@@ -1073,10 +1655,34 @@ final class PostChain implements AutoCloseable {
 						sampler[i] = samplers.get(ci.integer() ? SamplerCache.NEAREST_CLAMP : SamplerCache.LINEAR_CLAMP);
 						(isStorageBinding(bounds, i) ? storage : sampled).add(images[i]);
 					}
+					// Polydium's atlas and lightmap stay in GENERAL and were written in earlier Polydium passes, which the
+					// full barrier around Vulkan Iris's recording orders; they are not tracked here
+					case Atlas a -> {
+						images[i] = terrainInputs.atlas();
+						sampler[i] = samplers.get(ATLAS_SAMPLER);
+					}
+					case Lightmap l -> {
+						images[i] = terrainInputs.lightmap();
+						sampler[i] = samplers.get(SamplerCache.LINEAR_CLAMP);
+					}
+					case DepthNoTranslucent dn -> {
+						images[i] = depthNoTranslucent != null ? depthNoTranslucent : mainDepth;
+						sampler[i] = samplers.get(SamplerCache.NEAREST_CLAMP);
+						sampled.add(images[i]);
+					}
+					case ChunkData c -> {
+					}
 				}
 			}
 			// an image that is both sampled and a storage image in one program stays in GENERAL, which serves both
 			sampled.removeAll(storage);
+		}
+
+		/** Samples {@code copy} wherever this program would sample {@code from}. */
+		void replace(GpuImage from, GpuImage copy) {
+			for (int i = 0; i < images.length; i++) if (images[i] == from) images[i] = copy;
+			sampled.remove(from);
+			sampled.add(copy);
 		}
 
 		void declare(LayoutTracker.Use sampledUse, LayoutTracker.Use storageUse) {
@@ -1085,15 +1691,25 @@ final class PostChain implements AutoCloseable {
 		}
 
 		void write(long ds, List<Bound> bounds, ShaderResourceLayout layout, GpuBuffer ubo, long stride, int slot) {
+			write(ds, bounds, layout, ubo, stride, slot, writer, true, 0);
+		}
+
+		/** {@code fill}: evaluate the uniforms into the slot (once per program per frame); {@code chunkData}: iris_ChunkData buffer. */
+		void write(long ds, List<Bound> bounds, ShaderResourceLayout layout, GpuBuffer ubo, long stride, int slot,
+				   VulkanUniformWriter uniforms, boolean fill, long chunkData) {
 			try (DescriptorWrites w = new DescriptorWrites(ctx.device(), ds, images.length)) {
 				for (int i = 0; i < images.length; i++) {
 					Bound b = bounds.get(i);
 					switch (b.source()) {
 						case UniformBlock u -> {
-							ByteBuffer dst = MemoryUtil.memByteBuffer(ubo.mapped() + slot * stride, layout.uniformBufferSize());
-							writer.write(layout, dst);
+							if (fill) {
+								ByteBuffer dst = MemoryUtil.memByteBuffer(ubo.mapped() + slot * stride, layout.uniformBufferSize());
+								uniforms.write(layout, dst);
+							}
 							w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, ubo.buffer(), slot * stride, layout.uniformBufferSize());
 						}
+						// Sodium's ChunkData: ivec4 u_chunkFades[64] (std140), the same buffer Iris binds on GL
+						case ChunkData c -> w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, chunkData, 0, 64 * 16);
 						case TargetImage t -> w.storageImage(b.binding(), images[i]);
 						case Ssbo sb -> w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sb.buffer().buffer(), 0, VK_WHOLE_SIZE);
 						case CustomImage ci -> {
@@ -1210,6 +1826,8 @@ final class PostChain implements AutoCloseable {
 		for (List<Pass> list : passes.values()) for (Pass p : list) if (p.program != null) p.program.close();
 		if (finalPass != null) finalPass.program.close();
 		computePrograms.forEach(ComputeProgram::close);
+		for (Gbuffer g : terrain) if (g != null && g.program != null) g.program.close();
+		MemoryUtil.memFree(push);
 		if (sceneCopy != null) sceneCopy.close();
 		if (centerDepthProgram != null) centerDepthProgram.close();
 		if (targets != null) targets.close();

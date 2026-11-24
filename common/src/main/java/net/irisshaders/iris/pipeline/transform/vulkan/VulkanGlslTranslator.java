@@ -65,7 +65,8 @@ public final class VulkanGlslTranslator {
 	public static final int UNIFORM_BINDING = 0;
 
 	/** {@code attributes}: vertex input name → location, for building the pipeline's vertex input state. */
-	public record Result(Map<PatchShaderType, String> sources, ShaderResourceLayout layout, Map<String, Integer> attributes) {
+	public record Result(Map<PatchShaderType, String> sources, ShaderResourceLayout layout, Map<String, Integer> attributes,
+						 Map<String, ShaderResourceLayout.Uniform> pushConstants, int pushConstantSize) {
 	}
 
 	/** Blaze3D / Iris attribute names first, in a fixed order, so the same vertex format maps to the same locations. */
@@ -78,7 +79,15 @@ public final class VulkanGlslTranslator {
 	}
 
 	/** {@code registered}: uniform names Iris will supply values for (others with initialisers become const). */
-	public static synchronized Result translate(Map<PatchShaderType, String> sources, Predicate<String> registered) {
+	public static Result translate(Map<PatchShaderType, String> sources, Predicate<String> registered) {
+		return translate(sources, registered, List.of());
+	}
+
+	/**
+	 * {@code pushConstants}: loose uniforms that change per draw (e.g. Sodium's {@code u_RegionOffset}). They go into one
+	 * {@code layout(push_constant)} block, in the given order with std140 alignment, instead of {@code iris_Uniforms}.
+	 */
+	public static synchronized Result translate(Map<PatchShaderType, String> sources, Predicate<String> registered, List<String> pushConstants) {
 		Map<PatchShaderType, TranslationUnit> trees = new EnumMap<>(PatchShaderType.class);
 		sources.forEach((stage, src) -> {
 			if (src != null) trees.put(stage, parser.parseSeparateTranslationUnit(src));
@@ -116,6 +125,9 @@ public final class VulkanGlslTranslator {
 								default -> throw new IllegalArgumentException("unsupported opaque uniform " + opaque.type);
 							};
 							for (var member : List.copyOf(variables.getMembers())) {
+								// declared but never used: an inactive uniform on GL, which binds nothing for it. Dropping it
+								// also avoids false "samples what it renders to" conflicts (e.g. an unused colortex6 in gbuffers)
+								if (root.identifierIndex.get(member.getName().getName()).size() <= 1) continue;
 								var split = new TypeAndInitDeclaration(variables.getType().cloneInto(root), Stream.of(member.cloneInto(root)));
 								tree.getChildren().add(tree.getChildren().indexOf(declaration), new DeclarationExternalDeclaration(split));
 								int count = Glsl.dimensions(root, member.getArraySpecifier(), type.getArraySpecifier()).stream().reduce(1, Math::multiplyExact);
@@ -147,6 +159,17 @@ public final class VulkanGlslTranslator {
 		}
 
 		// std140 layout of the loose uniforms
+		Map<String, Uniform> pushed = new LinkedHashMap<>();
+		StringBuilder pushBody = new StringBuilder();
+		int pushOffset = 0;
+		for (String name : pushConstants) {
+			Std140Type t = uniformTypes.remove(name);
+			if (t == null) continue;
+			pushOffset = Std140Type.align(pushOffset, t.alignment());
+			pushed.put(name, new Uniform(pushOffset, t));
+			pushBody.append(t.declaration(name));
+			pushOffset = Math.addExact(pushOffset, t.size());
+		}
 		Map<String, Uniform> uniforms = new LinkedHashMap<>();
 		StringBuilder body = new StringBuilder();
 		int offset = 0, alignment = 16;
@@ -189,6 +212,7 @@ public final class VulkanGlslTranslator {
 		Map<String, Integer> attributes = assignLocations(trees);
 
 		String instance = Glsl.uniqueName(trees.values(), "iris_uniformData");
+		String pushInstance = Glsl.uniqueName(trees.values(), "iris_pushData");
 		PatchShaderType clipStage = lastPreRasterStage(trees.keySet());
 		Map<PatchShaderType, String> out = new EnumMap<>(PatchShaderType.class);
 		for (var entry : trees.entrySet()) {
@@ -198,7 +222,7 @@ public final class VulkanGlslTranslator {
 				for (String name : stageUniforms.getOrDefault(tree, List.of())) {
 					for (var id : root.identifierIndex.get(name).stream().toList()) {
 						if (id.getParent() instanceof ReferenceExpression ref && !Glsl.isShadowed(ref, name)) {
-							ref.replaceByAndDelete(parser.parseExpression(root, instance + "." + name));
+							ref.replaceByAndDelete(parser.parseExpression(root, (pushed.containsKey(name) ? pushInstance : instance) + "." + name));
 						}
 					}
 				}
@@ -206,6 +230,10 @@ public final class VulkanGlslTranslator {
 				if (!uniforms.isEmpty()) {
 					tree.parseAndInjectNode(parser, ASTInjectionPoint.BEFORE_DECLARATIONS, "layout(std140, set = " + SET + ", binding = "
 						+ UNIFORM_BINDING + ") uniform " + ShaderResourceLayout.UNIFORM_BLOCK + " {" + body + "} " + instance + ";");
+				}
+				if (!pushed.isEmpty()) {
+					tree.parseAndInjectNode(parser, ASTInjectionPoint.BEFORE_DECLARATIONS, "layout(push_constant, std140) uniform IrisPushConstants {"
+						+ pushBody + "} " + pushInstance + ";");
 				}
 				var vs = tree.getVersionStatement();
 				if (vs.version.number < Version.GLSL45.number) vs.version = Version.GLSL45;
@@ -220,7 +248,8 @@ public final class VulkanGlslTranslator {
 			if (entry.getKey() == PatchShaderType.FRAGMENT) glsl = readOnlyFragDepth(glsl);
 			out.put(entry.getKey(), glsl);
 		}
-		return new Result(out, new ShaderResourceLayout(Std140Type.align(offset, alignment), uniforms, descriptors), attributes);
+		return new Result(out, new ShaderResourceLayout(Std140Type.align(offset, alignment), uniforms, descriptors), attributes,
+			pushed, Std140Type.align(pushOffset, 4));
 	}
 
 	private static final java.util.regex.Pattern FRAG_DEPTH_WRITE = java.util.regex.Pattern.compile("gl_FragDepth[ \\t\\n]*(=[^=]|[-+*/]=)");
@@ -296,6 +325,7 @@ public final class VulkanGlslTranslator {
 			PatchShaderType stage = entry.getKey();
 			var root = entry.getValue().getRoot();
 			List<Io> list = new ArrayList<>();
+			List<DeclarationExternalDeclaration> unusedInputs = new ArrayList<>();
 			for (var external : entry.getValue().getChildren()) {
 				if (!(external instanceof DeclarationExternalDeclaration d) || !(d.getDeclaration() instanceof TypeAndInitDeclaration v)) continue;
 				var q = v.getType().getTypeQualifier();
@@ -309,6 +339,12 @@ public final class VulkanGlslTranslator {
 				boolean perVertex = in && (stage == PatchShaderType.GEOMETRY || stage == PatchShaderType.TESS_CONTROL || stage == PatchShaderType.TESS_EVAL)
 					|| outQ && stage == PatchShaderType.TESS_CONTROL;
 				int slots = slots(numeric, member, root, perVertex);
+				if (stage == PatchShaderType.VERTEX && in && root.identifierIndex.get(name).size() <= 1) {
+					// declared but never read (e.g. at_tangent after Iris's Sodium patch renames its uses): an inactive
+					// attribute on GL; dropped here so the pipeline needs no vertex data for it
+					unusedInputs.add(d);
+					continue;
+				}
 				if (stage == PatchShaderType.VERTEX && in) {
 					attributeSlots.merge(name, slots, Math::max);
 					list.add(new Io(v, "attr:" + name, slots));
@@ -318,6 +354,7 @@ public final class VulkanGlslTranslator {
 				}
 			}
 			ios.put(stage, list);
+			if (!unusedInputs.isEmpty()) root.indexBuildSession(() -> unusedInputs.forEach(DeclarationExternalDeclaration::detachAndDelete));
 		}
 		int next = 0;
 		for (var e : sizes.entrySet()) {

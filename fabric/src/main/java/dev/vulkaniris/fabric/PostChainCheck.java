@@ -49,6 +49,9 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Stream;
 
+import net.caffeinemc.mods.sodium.client.render.chunk.vertex.format.ChunkMeshFormats;
+import net.irisshaders.iris.shaderpack.materialmap.WorldRenderingSettings;
+
 import static org.lwjgl.vulkan.VK10.*;
 
 /**
@@ -60,8 +63,13 @@ import static org.lwjgl.vulkan.VK10.*;
  * completed, and its output is neither identical to vanilla nor a flat colour.
  */
 public final class PostChainCheck {
-	static final boolean ENABLED = Boolean.getBoolean("vulkaniris.phase6.selftest");
+	/** Phase 7: terrain is drawn with the pack's gbuffers programs (TerrainHook), and the report/PNGs go to vulkaniris-phase7. */
+	static final boolean GBUFFERS = Boolean.getBoolean("vulkaniris.phase7.selftest");
+	static final boolean ENABLED = Boolean.getBoolean("vulkaniris.phase6.selftest") || GBUFFERS;
+	private static final String PHASE = GBUFFERS ? "phase7" : "phase6";
 	private static final String WORLD = "vulkaniris-phase6";
+	/** Phase 7: frames to let Sodium rebuild every chunk in the pack's vertex format before counting. */
+	private static final int REBUILD_FRAMES = 240;
 	private static final int SETTLE_FRAMES = 300;
 	private static final int FRAMES_PER_PACK = 90;
 	private static final int TIMEOUT_FRAMES = 20_000;
@@ -85,6 +93,8 @@ public final class PostChainCheck {
 	private static SamplerCache samplers;
 	private static LayoutTracker tracker;
 	private static long depthView, depthViewImage;
+	private static int rebuildFrames, terrainPasses;
+	private static boolean terrainFailed;
 
 	private static List<Path> packs;
 	private static int packIndex = -1; // -1 = vanilla capture
@@ -102,6 +112,7 @@ public final class PostChainCheck {
 
 	/** GameRenderer.render TAIL: world setup and timeouts. */
 	public static void afterGameRender() {
+		if (ENABLED && done && !tornDown && finishSubmit >= 0 && PolydiumAccess.submitCompleted(finishSubmit)) teardown();
 		if (!ENABLED || done) return;
 		frames++;
 		try {
@@ -153,6 +164,14 @@ public final class PostChainCheck {
 			init();
 		}
 		destroyer.collect();
+		if (chain != null && chain.levelBegun() && (readbackSubmit >= 0 || PolydiumAccess.inRenderPass())) {
+			// terrain already began this frame's chain: it must be finished in this frame's command buffer
+			VkCommandBuffer c = PolydiumAccess.frameCommandBuffer();
+			if (PolydiumAccess.inRenderPass()) throw new IllegalStateException("level ended inside a Polydium render pass");
+			PolydiumAccess.polydiumBarrier(c);
+			chain.endLevel(c, tracker);
+			PolydiumAccess.polydiumBarrier(c);
+		}
 		if (readbackSubmit >= 0) {
 			if (!PolydiumAccess.submitCompleted(readbackSubmit)) return;
 			readbackSubmit = -1;
@@ -175,7 +194,15 @@ public final class PostChainCheck {
 		VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
 		PolydiumAccess.polydiumBarrier(cmd);
 		boolean capture;
-		if (chain != null) {
+		if (chain != null && chain.hasTerrain()) {
+			long t0 = System.nanoTime();
+			if (!chain.levelBegun()) chain.beginLevel(cmd, tracker, color, depth, depthAttachment(main));
+			chain.endLevel(cmd, tracker);
+			recordNanos += System.nanoTime() - t0;
+			if (rebuildFrames < REBUILD_FRAMES) rebuildFrames++;
+			else packFrames++;
+			capture = packFrames >= FRAMES_PER_PACK;
+		} else if (chain != null) {
 			long t0 = System.nanoTime();
 			boolean recorded = chain.record(cmd, tracker, color, depth);
 			if (recorded) {
@@ -228,7 +255,7 @@ public final class PostChainCheck {
 	}
 
 	private static Path outDir() {
-		return Minecraft.getInstance().gameDirectory.toPath().resolve("vulkaniris-phase6");
+		return Minecraft.getInstance().gameDirectory.toPath().resolve("vulkaniris-" + PHASE);
 	}
 
 	private static void startPack() {
@@ -254,12 +281,17 @@ public final class PostChainCheck {
 			ProgramSet set = new ShaderPack(root, new HashMap<>(), env, zip != null).getProgramSet(DimensionId.OVERWORLD);
 			RenderTarget main = Minecraft.getInstance().getMainRenderTarget();
 			chain = new PostChain(ctx, alloc, destroyer, clock, ring, samplers, compiler, set,
-				PolydiumAccess.vkFormat(main.getColorTexture()), main.width, main.height);
+				PolydiumAccess.vkFormat(main.getColorTexture()), PolydiumAccess.vkFormat(main.getDepthTexture()), main.width, main.height, GBUFFERS);
 			line("built " + chain.programCount() + " programs (Iris patch → Vulkan GLSL → SPIR-V → pipeline) in " + ms(System.nanoTime() - t0));
+			if (chain.hasTerrain()) startTerrain();
 		} catch (Throwable t) {
 			Iris.logger.error("[Vulkan Iris] phase 6: " + packName + " failed to build", t);
 			line("FAIL: could not build the chain: " + t);
 			allPassed = false;
+			if (chain != null) {
+				chain.close();
+				chain = null;
+			}
 			nextPack();
 		} finally {
 			if (zip != null) {
@@ -291,17 +323,23 @@ public final class PostChainCheck {
 		// passes colortex0 through without gbuffer data (miniature) legitimately reproduces the scene
 		int distinct = distinctColours(rgba);
 		boolean flat = distinct < 16;
-		boolean pass = !flat;
+		boolean pass = !flat && !(GBUFFERS && terrainFailed);
 		line(packFrames + " frames recorded" + (skippedFrames > 0 ? " (" + skippedFrames + " skipped: uniform slot still in flight)" : "")
 			+ ", CPU record time " + String.format("%.2f", recordNanos / 1e6 / Math.max(1, packFrames)) + " ms/frame (not a benchmark)");
 		line("output: " + st + ", differs from vanilla in " + (100L * differing / total) + "% of pixels");
 		for (String n : chain.notes()) line("  note: " + n);
 		chain.uniformFailures().forEach((k, v) -> line("  uniform " + k + " threw " + v + " (written as 0)"));
-		line(pass ? "PASS (renders; see notes for what is not implemented yet)" : "FAIL: output is (nearly) a flat colour (" + distinct + " distinct)");
+		line(pass ? "PASS (renders; see notes for what is not implemented yet)"
+			: flat ? "FAIL: output is (nearly) a flat colour (" + distinct + " distinct)" : "FAIL: terrain programs did not draw (see above)");
 		if (pass) passedPacks++;
 		allPassed &= pass;
-		vkQueueWaitIdle(ctx.graphicsQueue());
-		chain.close();
+		if (chain.hasTerrain()) line("terrain: " + terrainPasses + " terrain passes drawn with the pack's programs over " + (rebuildFrames + packFrames)
+			+ " frames; " + chain.staleRegions() + " region draws skipped while chunks were still in the old vertex format");
+		stopTerrain();
+		// this frame's command buffer (not submitted yet) may already hold the chain's terrain draws: destroy it only
+		// once that submission has finished
+		PostChain old = chain;
+		destroyer.defer("pack chain " + packName, old::close);
 		chain = null;
 		nextPack();
 	}
@@ -355,6 +393,59 @@ public final class PostChainCheck {
 		}
 	}
 
+	/** Phase 7: rebuild chunks in the pack's vertex format and take over Polydium's terrain draw. */
+	private static void startTerrain() {
+		rebuildFrames = 0;
+		terrainPasses = 0;
+		terrainFailed = false;
+		WorldRenderingSettings.INSTANCE.setVertexFormat(chain.vertexFormat());
+		TerrainHook.sink = PostChainCheck::drawTerrain;
+		Minecraft.getInstance().levelRenderer.allChanged();
+		line("terrain programs active; chunks rebuilding in the pack's vertex format (stride "
+			+ chain.vertexFormat().getVertexFormat().getStride() + " bytes)");
+	}
+
+	private static void stopTerrain() {
+		if (TerrainHook.sink == null) return;
+		TerrainHook.sink = null;
+		WorldRenderingSettings.INSTANCE.setVertexFormat(ChunkMeshFormats.COMPACT);
+		Minecraft.getInstance().levelRenderer.allChanged();
+	}
+
+	/** TerrainHook.Sink: Polydium's terrain pass, drawn with the pack's program inside Polydium's frame. */
+	private static boolean drawTerrain(int kind, List<PostChain.RegionDraw> draws, PostChain.TerrainInputs inputs) {
+		if (chain == null || terrainFailed) return true; // the chunk format no longer matches Polydium's pipeline
+		try {
+			if (PolydiumAccess.inRenderPass()) throw new IllegalStateException("terrain draw inside a Polydium render pass");
+			RenderTarget main = Minecraft.getInstance().getMainRenderTarget();
+			GpuImage color = GpuImage.external("main colour", PolydiumAccess.vkImage(main.getColorTexture()),
+				PolydiumAccess.vkImageView(main.getColorTextureView()), PolydiumAccess.vkFormat(main.getColorTexture()), main.width, main.height,
+				VK_IMAGE_ASPECT_COLOR_BIT, PolydiumAccess.TEXTURE_LAYOUT);
+			GpuImage depth = GpuImage.external("main depth", PolydiumAccess.vkImage(main.getDepthTexture()), depthView(main),
+				PolydiumAccess.vkFormat(main.getDepthTexture()), main.width, main.height, VK_IMAGE_ASPECT_DEPTH_BIT, PolydiumAccess.TEXTURE_LAYOUT);
+			VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
+			PolydiumAccess.polydiumBarrier(cmd);
+			if (!chain.levelBegun()) chain.beginLevel(cmd, tracker, color, depth, depthAttachment(main));
+			if (kind == TerrainHook.TRANSLUCENT && !chain.translucentDone()) chain.beforeTranslucent(cmd, tracker);
+			chain.drawTerrain(cmd, tracker, kind, draws, inputs);
+			PolydiumAccess.polydiumBarrier(cmd);
+			terrainPasses++;
+		} catch (Throwable t) {
+			terrainFailed = true;
+			Iris.logger.error("[Vulkan Iris] phase 7 terrain draw failed", t);
+			line("FAIL: terrain draw: " + t);
+			allPassed = false;
+		}
+		return true;
+	}
+
+	/** Polydium's own view of the main depth (all aspects), for drawing into it. */
+	private static GpuImage depthAttachment(RenderTarget main) {
+		return GpuImage.external("main depth attachment", PolydiumAccess.vkImage(main.getDepthTexture()),
+			PolydiumAccess.vkImageView(main.getDepthTextureView()), PolydiumAccess.vkFormat(main.getDepthTexture()), main.width, main.height,
+			VK_IMAGE_ASPECT_DEPTH_BIT, PolydiumAccess.TEXTURE_LAYOUT);
+	}
+
 	/** Our own depth-aspect view of Polydium's depth image. Recreated if the image changes. */
 	private static long depthView(RenderTarget main) {
 		long image = PolydiumAccess.vkImage(main.getDepthTexture());
@@ -384,9 +475,27 @@ public final class PostChainCheck {
 		finish();
 	}
 
+	/**
+	 * Ends the test. The frame being recorded may still reference Vulkan Iris's objects, and Polydium keeps recording
+	 * it after this returns, so they are destroyed (and the game stopped) only once that frame's submission finished.
+	 */
 	private static void finish() {
 		if (done) return;
 		done = true;
+		if (ctx != null) {
+			stopTerrain();
+			finishSubmit = PolydiumAccess.currentSubmitIndex();
+		} else {
+			teardown();
+		}
+	}
+
+	private static long finishSubmit = -1;
+	private static boolean tornDown;
+
+	private static void teardown() {
+		if (tornDown) return;
+		tornDown = true;
 		if (ctx != null) {
 			vkQueueWaitIdle(ctx.graphicsQueue());
 			if (chain != null) chain.close();
@@ -401,11 +510,11 @@ public final class PostChainCheck {
 			ctx.close();
 		}
 		int total = packs == null ? 0 : packs.size();
-		String head = "Vulkan Iris Phase 6 post chain test — " + ZonedDateTime.now() + "\nRESULT: " + (allPassed && total > 0 ? "PASS" : "FAIL")
+		String head = (GBUFFERS ? "Vulkan Iris Phase 7 terrain gbuffers test — " : "Vulkan Iris Phase 6 post chain test — ") + ZonedDateTime.now() + "\nRESULT: " + (allPassed && total > 0 ? "PASS" : "FAIL")
 			+ " — " + passedPacks + "/" + total + " packs rendered their deferred/composite/final chain on Vulkan\n";
 		Iris.logger.info("[Vulkan Iris] PHASE 6 " + head + report);
 		try {
-			Files.writeString(Minecraft.getInstance().gameDirectory.toPath().resolve("vulkaniris-phase6.txt"), head + report);
+			Files.writeString(Minecraft.getInstance().gameDirectory.toPath().resolve("vulkaniris-" + PHASE + ".txt"), head + report);
 		} catch (Exception e) {
 			Iris.logger.error("[Vulkan Iris] could not write phase 6 report", e);
 		}
