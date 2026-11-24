@@ -21,6 +21,7 @@ public class MixinLevelRendererVulkan {
 	private void vulkaniris$beginLevel(GraphicsResourceAllocator allocator, DeltaTracker deltaTracker, boolean bl, Camera camera, Matrix4f modelView,
 									   Matrix4f projection, Matrix4f matrix4f3, GpuBufferSlice fog, Vector4f vector4f, boolean bl2, CallbackInfo ci) {
 		FrameState.beginLevel(deltaTracker, modelView, projection);
+		PostChainCheck.beforeLevel();
 	}
 
 	@Inject(method = "renderLevel", at = @At("RETURN"))

@@ -33,8 +33,17 @@ public final class GraphicsProgram implements AutoCloseable {
 	public record Binding(String name, int binding, int type, int count, int stageFlags) {
 	}
 
-	public record Attribute(int location, int format, int offset) {
+	/**
+	 * {@code binding} 0: the vertex buffer (stride {@link Spec#vertexStride()}); binding {@link #CONSTANT_BINDING}: a buffer
+	 * read with stride 0, i.e. the same value for every vertex (GL's value for an attribute the vertex format doesn't have).
+	 */
+	public record Attribute(int location, int format, int offset, int binding) {
+		public Attribute(int location, int format, int offset) {
+			this(location, format, offset, 0);
+		}
 	}
+
+	public static final int CONSTANT_BINDING = 1;
 
 	/** Blend for one colour attachment; {@code null} = no blending. */
 	public record Blend(int srcColor, int dstColor, int srcAlpha, int dstAlpha) {
@@ -46,8 +55,12 @@ public final class GraphicsProgram implements AutoCloseable {
 	 * {@code depthFormat} 0 = no depth attachment.
 	 */
 	public record Raster(int depthFormat, boolean depthTest, boolean depthWrite, int depthCompare, int cullMode, int frontFace,
-						 int pushConstantSize) {
+						 int pushConstantSize, int colorWriteMask, float depthBiasConstant, float depthBiasSlope) {
 		public static final Raster NONE = new Raster(0, false, false, VK_COMPARE_OP_ALWAYS, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
+
+		public Raster(int depthFormat, boolean depthTest, boolean depthWrite, int depthCompare, int cullMode, int frontFace, int pushConstantSize) {
+			this(depthFormat, depthTest, depthWrite, depthCompare, cullMode, frontFace, pushConstantSize, 0xF, 0f, 0f);
+		}
 	}
 
 	public record Spec(String name, List<Stage> stages, List<byte[]> spirv, List<Binding> bindings, List<Attribute> attributes,
@@ -106,12 +119,14 @@ public final class GraphicsProgram implements AutoCloseable {
 
 			VkPipelineVertexInputStateCreateInfo vi = VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default();
 			if (!spec.attributes().isEmpty()) {
-				VkVertexInputBindingDescription.Buffer vb = VkVertexInputBindingDescription.calloc(1, stack);
+				boolean constant = spec.attributes().stream().anyMatch(a -> a.binding() == CONSTANT_BINDING);
+				VkVertexInputBindingDescription.Buffer vb = VkVertexInputBindingDescription.calloc(constant ? 2 : 1, stack);
 				vb.get(0).binding(0).stride(spec.vertexStride()).inputRate(VK_VERTEX_INPUT_RATE_VERTEX);
+				if (constant) vb.get(1).binding(CONSTANT_BINDING).stride(0).inputRate(VK_VERTEX_INPUT_RATE_VERTEX);
 				VkVertexInputAttributeDescription.Buffer va = VkVertexInputAttributeDescription.calloc(spec.attributes().size(), stack);
 				for (int i = 0; i < spec.attributes().size(); i++) {
 					Attribute a = spec.attributes().get(i);
-					va.get(i).location(a.location()).binding(0).format(a.format()).offset(a.offset());
+					va.get(i).location(a.location()).binding(a.binding()).format(a.format()).offset(a.offset());
 				}
 				vi.pVertexBindingDescriptions(vb).pVertexAttributeDescriptions(va);
 			}
@@ -120,7 +135,7 @@ public final class GraphicsProgram implements AutoCloseable {
 			VkPipelineColorBlendAttachmentState.Buffer blend = VkPipelineColorBlendAttachmentState.calloc(Math.max(1, n), stack);
 			for (int i = 0; i < n; i++) {
 				Blend bl = spec.blends() == null ? null : spec.blends()[i];
-				blend.get(i).colorWriteMask(0xF).blendEnable(bl != null);
+				blend.get(i).colorWriteMask(spec.raster().colorWriteMask()).blendEnable(bl != null);
 				if (bl != null) {
 					blend.get(i).srcColorBlendFactor(bl.srcColor()).dstColorBlendFactor(bl.dstColor()).colorBlendOp(VK_BLEND_OP_ADD)
 						.srcAlphaBlendFactor(bl.srcAlpha()).dstAlphaBlendFactor(bl.dstAlpha()).alphaBlendOp(VK_BLEND_OP_ADD);
@@ -139,7 +154,9 @@ public final class GraphicsProgram implements AutoCloseable {
 				.pInputAssemblyState(VkPipelineInputAssemblyStateCreateInfo.calloc(stack).sType$Default().topology(spec.topology()))
 				.pViewportState(VkPipelineViewportStateCreateInfo.calloc(stack).sType$Default().viewportCount(1).scissorCount(1))
 				.pRasterizationState(VkPipelineRasterizationStateCreateInfo.calloc(stack).sType$Default()
-					.polygonMode(VK_POLYGON_MODE_FILL).cullMode(r.cullMode()).frontFace(r.frontFace()).lineWidth(1f))
+					.polygonMode(VK_POLYGON_MODE_FILL).cullMode(r.cullMode()).frontFace(r.frontFace()).lineWidth(1f)
+					.depthBiasEnable(r.depthBiasConstant() != 0f || r.depthBiasSlope() != 0f)
+					.depthBiasConstantFactor(r.depthBiasConstant()).depthBiasSlopeFactor(r.depthBiasSlope()))
 				.pMultisampleState(VkPipelineMultisampleStateCreateInfo.calloc(stack).sType$Default().rasterizationSamples(VK_SAMPLE_COUNT_1_BIT))
 				.pDepthStencilState(VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default()
 					.depthTestEnable(r.depthTest()).depthWriteEnable(r.depthWrite()).depthCompareOp(r.depthCompare()))

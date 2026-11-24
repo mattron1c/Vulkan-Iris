@@ -1,7 +1,16 @@
 package dev.vulkaniris.fabric;
 
 import com.google.common.collect.ImmutableMap;
+import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.platform.DepthTestFunction;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormatElement;
+import net.irisshaders.iris.gl.state.ShaderAttributeInputs;
+import net.irisshaders.iris.pipeline.IrisPipelines;
+import net.irisshaders.iris.pipeline.programs.ShaderKey;
+import net.irisshaders.iris.uniforms.VanillaUniforms;
 import dev.vulkaniris.vk.ComputeProgram;
 import dev.vulkaniris.vk.DescriptorRing;
 import dev.vulkaniris.vk.DescriptorWrites;
@@ -311,7 +320,10 @@ final class PostChain implements AutoCloseable {
 			writer.override(glOnly, () -> new double[]{0, 0});
 		}
 		writer.attachCustom(customUniforms);
-		if (withGbuffers) setupGbufferUniforms();
+		if (withGbuffers) {
+			setupGbufferUniforms();
+			setupVanillaUniforms();
+		}
 
 		Map<Integer, PackRenderTargetDirectives.RenderTargetSettings> settings = directives.getRenderTargetDirectives().getRenderTargetSettings();
 		for (int i = 0; i < targetFormats.length; i++) {
@@ -333,7 +345,11 @@ final class PostChain implements AutoCloseable {
 		Set<Integer> flippedOnce = new HashSet<>();
 		// Iris IrisRenderingPipeline: setup programs run once, before everything else
 		this.setup = buildComputes(compiler, set.getSetup(), TextureStage.SETUP, used, Set.of());
-		if (withGbuffers) buildTerrain(compiler, used);
+		if (withGbuffers) {
+			buildTerrain(compiler, used);
+			// without terrain programs colortex0 gets the vanilla frame before deferred, which would overwrite pack entity draws
+			if (hasTerrain()) buildVanilla(compiler, used);
+		}
 		for (Stage st : STAGES) {
 			flippedOnce = new HashSet<>(); // Iris: one CompositeRenderer per stage, each with its own flippedAtLeastOnce
 			List<Pass> list = new ArrayList<>();
@@ -777,7 +793,7 @@ final class PostChain implements AutoCloseable {
 			terrain[k] = g;
 		}
 		notes.add("terrain drawn with the pack's programs (" + terrain[0].name + ", " + terrain[1].name + ", " + terrain[2].name
-			+ "), vertex stride " + stride + "; entities, sky, hand, particles, clouds and weather are not drawn into the gbuffers yet (7c)");
+			+ "), vertex stride " + stride + "; the hand and clouds are not drawn into the gbuffers yet");
 	}
 
 	/** Iris BlendModeOverride (GL blend factors) as a Vulkan blend; OFF = no blending. */
@@ -812,6 +828,436 @@ final class PostChain implements AutoCloseable {
 	/** The chunk vertex format the terrain programs need (Sodium's compact one if there are none). */
 	ChunkVertexType vertexFormat() {
 		return vertexFormat;
+	}
+
+	// ------------------------------------------------------------------ 7c: vanilla geometry (Iris IrisPipelines / ShaderCreator / ExtendedShader)
+
+	/** What a vanilla draw has bound on Polydium's render pass at the time of the draw. */
+	interface PassState {
+		/** The uniform buffer vanilla set under {@code name} (DynamicTransforms, Projection, Fog, Globals, CloudInfo): {VkBuffer, offset, length}, or null. */
+		long[] block(String name);
+
+		/** The texture vanilla bound to {@code name} (Sampler0/1/2), or null. */
+		GpuImage texture(String name);
+
+		/** The VkSampler vanilla bound with {@code name}'s texture. */
+		long sampler(String name);
+
+		/** Viewport size and the current scissor rectangle {x, y, w, h}. */
+		int viewportWidth();
+
+		int viewportHeight();
+
+		int[] scissor();
+	}
+
+	/** A vanilla uniform block ({@code iris_<name>} in the patched program) that the render pass set. */
+	private record PassBlock(String name) implements Source {
+	}
+
+	/** A vanilla sampler (Sampler0 albedo, Sampler1 overlay, Sampler2 lightmap) that the render pass bound. */
+	private record PassSampler(String name) implements Source {
+	}
+
+	/** One pack program for an Iris ShaderKey; pipelines are made per vanilla RenderPipeline it replaces (vanilla's state, the pack's shaders). */
+	private static final class Vanilla {
+		ShaderKey key;
+		String name;
+		ShaderResourceLayout layout;
+		List<Bound> bounds = new ArrayList<>();
+		int[] drawBuffers;
+		GpuBuffer ubo;
+		long stride;
+		final long[] slotSubmit = new long[SLOTS];
+		long filledFrame = -1, feedbackFrame = -1;
+		float alphaTest;
+		boolean usesSsbo;
+		List<GraphicsProgram.Stage> stages;
+		List<byte[]> spirv;
+		List<GraphicsProgram.Binding> bindings;
+		Map<String, Integer> attributes;
+		/** Pack blend directive (Iris ExtendedShader applies it over vanilla's blend); empty Optional inside = "off". */
+		Optional<BlendModeOverride> blendOverride = Optional.empty();
+		final Map<Integer, BlendModeOverride> bufferBlends = new HashMap<>();
+		final Map<RenderPipeline, GraphicsProgram[]> variants = new IdentityHashMap<>();
+		final Map<RenderPipeline, Boolean> usesConstants = new IdentityHashMap<>();
+		long draws;
+	}
+
+	private final Map<ShaderKey, Vanilla> vanilla = new EnumMap<>(ShaderKey.class);
+	private final Map<ShaderKey, String> vanillaFailures = new EnumMap<>(ShaderKey.class);
+	private final VulkanUniformWriter vanillaWriter = new VulkanUniformWriter();
+	private ShaderAttributeInputs resolvingVanilla;
+	private PassState passState;
+	private GpuBuffer constantAttributes;
+	private GpuImage[] vanillaOuts;
+	private boolean vanillaOpen, vanillaOpenDepth;
+	private final Set<String> unmappedPipelines = new TreeSet<>();
+
+	/** Iris ShaderCreator.create's uniforms (CommonUniforms PER_VERTEX, custom, builtin replacements, VanillaUniforms) and ExtendedShader's matrices. */
+	private void setupVanillaUniforms() {
+		var idMap = set.getPack().getIdMap();
+		CommonUniforms.addNonDynamicUniforms(vanillaWriter, idMap, directives, notifier);
+		CommonUniforms.addDynamicUniforms(vanillaWriter, FogMode.PER_VERTEX);
+		BuiltinReplacementUniforms.addBuiltinReplacementUniforms(vanillaWriter);
+		VanillaUniforms.addVanillaUniforms(vanillaWriter);
+		vanillaWriter.override("blendFunc", () -> new double[]{0, 0, 0, 0});
+		vanillaWriter.override("atlasSize", () -> new double[]{atlasWidth, atlasHeight});
+		vanillaWriter.override("gtextureSize", () -> new double[]{atlasWidth, atlasHeight});
+		vanillaWriter.override("gtextureId", () -> new double[]{0});
+		// ExtendedShader.iris$setupState: inverse model-view and normal matrix from RenderSystem's model-view, projection inverse
+		// from the captured gbuffer projection
+		vanillaWriter.override("iris_ModelViewMatInverse", () -> mat4(new Matrix4f(RenderSystem.getModelViewMatrix()).invert()));
+		vanillaWriter.override("iris_NormalMat", () -> {
+			Matrix3f n = new Matrix4f(RenderSystem.getModelViewMatrix()).invert().transpose3x3(new Matrix3f());
+			float[] f = n.get(new float[9]);
+			double[] d = new double[9];
+			for (int i = 0; i < 9; i++) d[i] = f[i];
+			return d;
+		});
+		vanillaWriter.override("iris_ProjMatInverse", () -> mat4(new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferProjection()).invert()));
+		vanillaWriter.attachCustom(customUniforms);
+	}
+
+	/** The ShaderKeys Iris maps the world's vanilla pipelines to (IrisPipelines' main map), minus the ones Sodium/Polydium terrain covers. */
+	private static boolean isVanillaKey(ShaderKey k) {
+		if (k.isShadow()) return false;
+		return switch (k) {
+			// hand programs: Iris draws the hand in its own pass after the world (HandRenderer), which isn't ported yet
+			case HAND_CUTOUT, HAND_CUTOUT_BRIGHT, HAND_CUTOUT_DIFFUSE, HAND_TEXT, HAND_TEXT_TRANSLUCENT, HAND_TEXT_INTENSITY,
+				 HAND_TRANSLUCENT, HAND_WATER_BRIGHT, HAND_WATER_DIFFUSE -> false;
+			// other mods' formats, and Sodium's own clouds
+			case IE_COMPAT, MEKANISM_FLAME, CLOUDS_SODIUM -> false;
+			default -> true;
+		};
+	}
+
+	/**
+	 * Iris IrisRenderingPipeline.createShader / ShaderCreator.create for every main-pass ShaderKey: the key's program through
+	 * Iris's fallback chain, patched with patchVanilla, translated and compiled. Pipelines are made at first use, per vanilla
+	 * RenderPipeline (vertex format, topology, blend, depth and cull are vanilla's, as on GL).
+	 */
+	private void buildVanilla(ShaderCompiler compiler, Set<Integer> used) {
+		ProgramFallbackResolver resolver = new ProgramFallbackResolver(set);
+		for (ShaderKey key : ShaderKey.values()) {
+			if (!isVanillaKey(key)) continue;
+			Optional<ProgramSource> found = resolver.resolve(key.getProgram());
+			if (found.isEmpty()) {
+				vanillaFailures.put(key, "no program in the pack's fallback chain (Iris would use its synthesized fallback shader; not implemented yet)");
+				continue;
+			}
+			ProgramSource src = found.get();
+			try {
+				vanilla.put(key, buildVanillaProgram(compiler, key, src, resolver, used));
+			} catch (RuntimeException e) {
+				vanillaFailures.put(key, src.getName() + ": " + e.getMessage());
+			}
+		}
+		for (var e : vanillaFailures.entrySet()) notes.add("gbuffers " + e.getKey().getName() + ": not drawn with the pack (" + e.getValue() + ")");
+		int[] constants = {0, 0, 0, Float.floatToIntBits(1f), 0, 0, 0, 1};
+		constantAttributes = buffer("GL default vertex attributes", 32, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+		MemoryUtil.memIntBuffer(constantAttributes.mapped(), constants.length).put(constants);
+		alloc.flush(constantAttributes);
+	}
+
+	private Vanilla buildVanillaProgram(ShaderCompiler compiler, ShaderKey key, ProgramSource src, ProgramFallbackResolver resolver, Set<Integer> used) {
+		if (src.getTessEvalSource().isPresent() || src.getTessControlSource().isPresent()) {
+			throw new IllegalStateException("tessellation (not implemented yet)");
+		}
+		Vanilla v = new Vanilla();
+		v.key = key;
+		v.name = src.getName() + " (" + key.getName() + ")";
+		var d = src.getDirectives();
+		AlphaTest alpha = d.getAlphaTestOverride().orElse(key.getAlphaTest());
+		v.alphaTest = alpha.reference();
+		boolean isLines = key.getProgram() == ProgramId.Line && resolver.has(ProgramId.Line);
+		ShaderAttributeInputs inputs = new ShaderAttributeInputs(key.getVertexFormat(), key.shouldIgnoreLightmap(), isLines, key.isGlint(), key.isText(),
+			key == ShaderKey.IE_COMPAT);
+		Map<PatchShaderType, String> gl = TransformPatcher.patchVanilla(v.name, src.getVertexSource().orElseThrow(), src.getGeometrySource().orElse(null),
+			null, null, src.getFragmentSource().orElseThrow(), alpha, isLines, key == ShaderKey.CLOUDS, true, inputs, directives.getTextureMap());
+		var vk = VulkanGlslTranslator.translate(gl, vanillaWriter::provides);
+		v.layout = vk.layout();
+		v.attributes = vk.attributes();
+		for (String u : vanillaWriter.unresolved(v.layout)) notes.add(v.name + ": uniform " + u + " has no Vulkan value yet (zero)");
+		v.drawBuffers = d.getDrawBuffers();
+		for (int b : v.drawBuffers) used.add(b);
+		v.stages = new ArrayList<>();
+		v.spirv = new ArrayList<>();
+		for (var e : vk.sources().entrySet()) {
+			v.stages.add(switch (e.getKey()) {
+				case VERTEX -> GraphicsProgram.Stage.VERTEX;
+				case GEOMETRY -> GraphicsProgram.Stage.GEOMETRY;
+				case FRAGMENT -> GraphicsProgram.Stage.FRAGMENT;
+				default -> throw new IllegalStateException("stage " + e.getKey());
+			});
+			v.spirv.add(compiler.compile(v.name + e.getKey().extension, compilerStage(e.getKey()), e.getValue()));
+		}
+		resolvingGbuffer = true;
+		resolvingVanilla = inputs;
+		try {
+			v.bindings = bindResources(v.name, v.layout, TextureStage.GBUFFERS_AND_SHADOW, used, Set.of(), VK_SHADER_STAGE_ALL_GRAPHICS, v.bounds);
+		} finally {
+			resolvingGbuffer = false;
+			resolvingVanilla = null;
+		}
+		v.usesSsbo = v.bounds.stream().anyMatch(b -> b.source() instanceof Ssbo);
+		// Iris ShaderCreator: the program's blend directive, else the program id's default override; then per-buffer ones
+		Optional<BlendModeOverride> o = d.getBlendModeOverride();
+		if (o.isEmpty() && key.getProgram().getBlendModeOverride() != null) o = Optional.of(key.getProgram().getBlendModeOverride());
+		v.blendOverride = o;
+		for (var info : d.getBufferBlendOverrides()) {
+			for (int i = 0; i < v.drawBuffers.length; i++) if (v.drawBuffers[i] == info.index()) v.bufferBlends.put(i, new BlendModeOverride(info.blendMode()));
+		}
+		if (d.getViewportScale() != null && d.getViewportScale().scale() != 1.0f) notes.add(v.name + ": viewport scale ignored (not implemented yet)");
+		if (v.layout.uniformBufferSize() > 0) {
+			v.stride = alignUp(v.layout.uniformBufferSize(), UBO_ALIGN);
+			v.ubo = buffer(v.name + " uniforms", v.stride * SLOTS, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+		}
+		Arrays.fill(v.slotSubmit, -1);
+		programCount++;
+		return v;
+	}
+
+	/** The pack program Iris would draw this vanilla pipeline with, or null (then Polydium draws it as vanilla). */
+	ShaderKey vanillaKey(RenderPipeline pipeline) {
+		ShaderKey key = IrisPipelines.getPipeline(null, pipeline);
+		if (key == null) {
+			unmappedPipelines.add(pipeline.getLocation().toString());
+			return null;
+		}
+		return vanilla.containsKey(key) ? key : null;
+	}
+
+	Set<String> unmappedPipelines() {
+		return unmappedPipelines;
+	}
+
+	Map<String, Long> vanillaDraws() {
+		Map<String, Long> m = new TreeMap<>();
+		for (Vanilla v : vanilla.values()) if (v.draws > 0) m.put(v.name, v.draws);
+		return m;
+	}
+
+	private static final String[] FLOAT_DEFAULTS = {"mc_Entity", "mc_midTexCoord", "at_tangent", "at_midBlock"};
+
+	/** Iris's attribute names for vanilla's vertex elements (VertexFormatExtension.bindAttributesIris). */
+	private static VertexFormatElement element(String attribute) {
+		return switch (attribute) {
+			case "iris_Position" -> VertexFormatElement.POSITION;
+			case "iris_Color" -> VertexFormatElement.COLOR;
+			case "iris_UV0" -> VertexFormatElement.UV0;
+			case "iris_UV1" -> VertexFormatElement.UV1;
+			case "iris_UV2" -> VertexFormatElement.UV2;
+			case "iris_Normal" -> VertexFormatElement.NORMAL;
+			case "iris_LineWidth" -> VertexFormatElement.LINE_WIDTH;
+			default -> null;
+		};
+	}
+
+	/** GL's vertex attribute setup for a vanilla element: integer UVs are read as integers, other non-float types normalized. */
+	private static int vkFormat(VertexFormatElement e) {
+		int n = e.count();
+		boolean integer = e.usage() == VertexFormatElement.Usage.UV;
+		return switch (e.type()) {
+			case FLOAT -> new int[]{VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT}[n - 1];
+			case UBYTE -> (integer ? new int[]{VK_FORMAT_R8_UINT, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8B8_UINT, VK_FORMAT_R8G8B8A8_UINT}
+				: new int[]{VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM})[n - 1];
+			case BYTE -> (integer ? new int[]{VK_FORMAT_R8_SINT, VK_FORMAT_R8G8_SINT, VK_FORMAT_R8G8B8_SINT, VK_FORMAT_R8G8B8A8_SINT}
+				: new int[]{VK_FORMAT_R8_SNORM, VK_FORMAT_R8G8_SNORM, VK_FORMAT_R8G8B8_SNORM, VK_FORMAT_R8G8B8A8_SNORM})[n - 1];
+			case USHORT -> (integer ? new int[]{VK_FORMAT_R16_UINT, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16B16_UINT, VK_FORMAT_R16G16B16A16_UINT}
+				: new int[]{VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16A16_UNORM})[n - 1];
+			case SHORT -> (integer ? new int[]{VK_FORMAT_R16_SINT, VK_FORMAT_R16G16_SINT, VK_FORMAT_R16G16B16_SINT, VK_FORMAT_R16G16B16A16_SINT}
+				: new int[]{VK_FORMAT_R16_SNORM, VK_FORMAT_R16G16_SNORM, VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16A16_SNORM})[n - 1];
+			case UINT -> new int[]{VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32A32_UINT}[n - 1];
+			case INT -> new int[]{VK_FORMAT_R32_SINT, VK_FORMAT_R32G32_SINT, VK_FORMAT_R32G32B32_SINT, VK_FORMAT_R32G32B32A32_SINT}[n - 1];
+		};
+	}
+
+	private static int topology(VertexFormat.Mode mode) {
+		return switch (mode) {
+			// vanilla draws quads and its widened lines as indexed triangles
+			case QUADS, TRIANGLES, LINES -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+			case TRIANGLE_STRIP -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+			case TRIANGLE_FAN -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+			case DEBUG_LINES -> VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+			case DEBUG_LINE_STRIP -> VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+			case POINTS -> VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+		};
+	}
+
+	private static int vkBlend(String factor) {
+		return switch (factor) {
+			case "ZERO" -> VK_BLEND_FACTOR_ZERO;
+			case "ONE" -> VK_BLEND_FACTOR_ONE;
+			case "SRC_COLOR" -> VK_BLEND_FACTOR_SRC_COLOR;
+			case "ONE_MINUS_SRC_COLOR" -> VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+			case "SRC_ALPHA" -> VK_BLEND_FACTOR_SRC_ALPHA;
+			case "ONE_MINUS_SRC_ALPHA" -> VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+			case "DST_ALPHA" -> VK_BLEND_FACTOR_DST_ALPHA;
+			case "ONE_MINUS_DST_ALPHA" -> VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+			case "DST_COLOR" -> VK_BLEND_FACTOR_DST_COLOR;
+			case "ONE_MINUS_DST_COLOR" -> VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+			case "SRC_ALPHA_SATURATE" -> VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+			case "CONSTANT_COLOR" -> VK_BLEND_FACTOR_CONSTANT_COLOR;
+			case "ONE_MINUS_CONSTANT_COLOR" -> VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+			case "CONSTANT_ALPHA" -> VK_BLEND_FACTOR_CONSTANT_ALPHA;
+			case "ONE_MINUS_CONSTANT_ALPHA" -> VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+			default -> throw new IllegalStateException("blend factor " + factor + " (not implemented yet)");
+		};
+	}
+
+	private static int depthCompare(DepthTestFunction f) {
+		return switch (f) {
+			case NO_DEPTH_TEST -> VK_COMPARE_OP_ALWAYS;
+			case EQUAL_DEPTH_TEST -> VK_COMPARE_OP_EQUAL;
+			case LEQUAL_DEPTH_TEST -> VK_COMPARE_OP_LESS_OR_EQUAL;
+			case LESS_DEPTH_TEST -> VK_COMPARE_OP_LESS;
+			case GREATER_DEPTH_TEST -> VK_COMPARE_OP_GREATER;
+		};
+	}
+
+	/** The pack program with vanilla's fixed-function state for {@code p}, into the program's draw buffers (+ main depth). */
+	private GraphicsProgram variant(Vanilla v, RenderPipeline p, boolean depth) {
+		GraphicsProgram[] arr = v.variants.computeIfAbsent(p, k -> new GraphicsProgram[2]);
+		int i = depth ? 1 : 0;
+		if (arr[i] != null) return arr[i];
+		VertexFormat format = p.getVertexFormat();
+		List<GraphicsProgram.Attribute> attributes = new ArrayList<>();
+		boolean constants = false;
+		for (var a : v.attributes.entrySet()) {
+			VertexFormatElement e = element(a.getKey());
+			if (e != null && format.contains(e)) {
+				attributes.add(new GraphicsProgram.Attribute(a.getValue(), vkFormat(e), format.getOffset(e)));
+				continue;
+			}
+			// GL: an attribute the vertex format doesn't supply reads the current value, (0, 0, 0, 1) by default
+			boolean integer = a.getKey().equals("iris_UV1") || a.getKey().equals("iris_UV2") || a.getKey().equals("iris_Entity");
+			if (e == null && !integer && !Arrays.asList(FLOAT_DEFAULTS).contains(a.getKey())) {
+				throw new IllegalStateException(v.name + " reads vertex attribute " + a.getKey() + " (not implemented yet)");
+			}
+			if (!a.getKey().startsWith("iris_") || a.getKey().equals("iris_Entity")) {
+				notes.add(v.name + ": " + a.getKey() + " = GL's default (0,0,0,1): Iris's extended entity vertex format isn't ported yet");
+			}
+			attributes.add(new GraphicsProgram.Attribute(a.getValue(), integer ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT,
+				integer ? 16 : 0, GraphicsProgram.CONSTANT_BINDING));
+			constants = true;
+		}
+		v.usesConstants.put(p, constants);
+
+		int n = v.drawBuffers.length;
+		int[] colorFormats = new int[n];
+		GraphicsProgram.Blend[] blends = new GraphicsProgram.Blend[n];
+		GraphicsProgram.Blend base = p.getBlendFunction().map(b -> new GraphicsProgram.Blend(vkBlend(b.sourceColor().name()), vkBlend(b.destColor().name()),
+			vkBlend(b.sourceAlpha().name()), vkBlend(b.destAlpha().name()))).orElse(null);
+		if (v.blendOverride.isPresent()) base = blend(v.blendOverride.get());
+		for (int k = 0; k < n; k++) {
+			colorFormats[k] = RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[v.drawBuffers[k]]));
+			blends[k] = v.bufferBlends.containsKey(k) ? blend(v.bufferBlends.get(k)) : base;
+			if (blends[k] != null && VkFormats.isInteger(targetFormats[v.drawBuffers[k]])) {
+				// GL ignores blending for integer attachments; Vulkan forbids enabling it
+				blends[k] = null;
+			}
+		}
+		if (p.getPolygonMode() != com.mojang.blaze3d.platform.PolygonMode.FILL) notes.add(p.getLocation() + ": polygon mode " + p.getPolygonMode() + " drawn filled (not implemented yet)");
+		if (p.getColorLogic() != com.mojang.blaze3d.platform.LogicOp.NONE) notes.add(p.getLocation() + ": colour logic op " + p.getColorLogic() + " ignored (not implemented yet)");
+		boolean test = depth && p.getDepthTestFunction() != DepthTestFunction.NO_DEPTH_TEST;
+		int mask = (p.isWriteColor() ? VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT : 0) | (p.isWriteAlpha() ? VK_COLOR_COMPONENT_A_BIT : 0);
+		var raster = new GraphicsProgram.Raster(depth ? mainDepthFormat : 0, test, depth && p.isWriteDepth(), depthCompare(p.getDepthTestFunction()),
+			p.isCull() ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE, 0, mask, p.getDepthBiasConstant(), p.getDepthBiasScaleFactor());
+		arr[i] = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec(v.name + " / " + p.getLocation(), v.stages, v.spirv, v.bindings, attributes,
+			format.getVertexSize(), topology(p.getVertexFormatMode()), colorFormats, blends, raster));
+		return arr[i];
+	}
+
+	/**
+	 * One vanilla draw with the pack's program (Iris ExtendedShader: vanilla's buffers, uniform blocks and textures; the
+	 * pack's shaders and targets). Called while Polydium's own rendering is suspended; consecutive draws into the same
+	 * targets share one dynamic-rendering scope. {@code indexed}: vkCmdDrawIndexed(a..e), else vkCmdDraw(a..d).
+	 */
+	void drawVanilla(VkCommandBuffer cmd, LayoutTracker tracker, ShaderKey key, RenderPipeline pipeline, PassState st, boolean depth,
+					 boolean indexed, int a, int b, int c, int d, int e) {
+		if (!levelBegun) throw new IllegalStateException("vanilla draw before beginLevel");
+		Vanilla v = vanilla.get(key);
+		this.cmd = cmd;
+		this.tracker = tracker;
+		this.currentDepth = mainDepth;
+		passState = st;
+		GpuImage[] outs = new GpuImage[v.drawBuffers.length];
+		for (int i = 0; i < outs.length; i++) outs[i] = targets.read(v.drawBuffers[i]);
+		Resolved r = new Resolved(v.bounds, mainDepth);
+		boolean sameTargets = vanillaOpen && vanillaOpenDepth == depth && Arrays.equals(outs, vanillaOuts);
+		for (GpuImage o : outs) {
+			if (r.storage.contains(o)) throw new IllegalStateException(v.name + " uses " + o.name() + " as a storage image and renders to it (not implemented)");
+			if (r.sampled.contains(o)) {
+				GpuImage copy = feedbackCopy(o);
+				if (v.feedbackFrame != frame) {
+					// once per program per frame (GL would see every earlier draw; see notes)
+					endVanilla();
+					copyColor(o, copy);
+					v.feedbackFrame = frame;
+					sameTargets = false;
+				}
+				r.replace(o, copy);
+				notes.add(v.name + ": samples " + o.name() + " while drawing into it (GL feedback loop); reads a copy taken at the program's first draw of the frame");
+			}
+		}
+		r.declare(LayoutTracker.Use.SAMPLED_GRAPHICS, LayoutTracker.Use.STORAGE_FRAGMENT);
+		if (!sameTargets || tracker.hasPending()) {
+			if (vanillaOpen) {
+				GraphicsProgram.endRendering(cmd);
+				vanillaOpen = false;
+			}
+			for (GpuImage o : outs) tracker.use(o, LayoutTracker.Use.COLOR_ATTACHMENT);
+			if (depth) tracker.use(mainDepthAttachment, LayoutTracker.Use.DEPTH_ATTACHMENT);
+			tracker.flush(cmd);
+			if (v.usesSsbo) memoryBarrier();
+			GraphicsProgram.beginRendering(cmd, outs, depth ? mainDepthAttachment : null);
+			vanillaOpen = true;
+			vanillaOpenDepth = depth;
+			vanillaOuts = outs;
+		}
+
+		GraphicsProgram program = variant(v, pipeline, depth);
+		int slot = (int) (frame % SLOTS);
+		boolean fill = v.filledFrame != frame;
+		if (fill) {
+			v.slotSubmit[slot] = clock.currentIndex();
+			v.filledFrame = frame;
+			CapturedRenderingState.INSTANCE.setCurrentAlphaTest(v.alphaTest);
+		}
+		long ds = ring.allocate(program.setLayout());
+		r.write(ds, v.bounds, v.layout, v.ubo, v.stride, slot, vanillaWriter, fill, 0);
+		program.bind(cmd, ds);
+		try (MemoryStack s = MemoryStack.stackPush()) {
+			if (v.usesConstants.get(pipeline)) vkCmdBindVertexBuffers(cmd, GraphicsProgram.CONSTANT_BINDING, s.longs(constantAttributes.buffer()), s.longs(0));
+			VkViewport.Buffer vp = VkViewport.calloc(1, s);
+			vp.get(0).width(st.viewportWidth()).height(st.viewportHeight()).maxDepth(1f);
+			vkCmdSetViewport(cmd, 0, vp);
+			int[] sc = st.scissor();
+			VkRect2D.Buffer rect = VkRect2D.calloc(1, s);
+			rect.get(0).offset(o -> o.set(sc[0], sc[1])).extent(x -> x.set(sc[2], sc[3]));
+			vkCmdSetScissor(cmd, 0, rect);
+		}
+		if (indexed) vkCmdDrawIndexed(cmd, a, b, c, d, e);
+		else vkCmdDraw(cmd, a, b, c, d);
+		v.draws++;
+		passState = null;
+	}
+
+	/** Ends Vulkan Iris's rendering scope for vanilla draws, if one is open (before Polydium resumes its own pass). */
+	void endVanilla() {
+		if (vanillaOpen) {
+			GraphicsProgram.endRendering(cmd);
+			vanillaOpen = false;
+		}
+		vanillaOuts = null;
+	}
+
+	/** {@link #endVanilla} for the caller, then hands the external images back to Polydium. */
+	void endVanilla(VkCommandBuffer cmd) {
+		this.cmd = cmd;
+		endVanilla();
+		endSegment();
 	}
 
 	// ------------------------------------------------------------------ custom images (Iris GlImage)
@@ -878,8 +1324,44 @@ final class PostChain implements AutoCloseable {
 		}
 	}
 
+	/** Iris IrisSamplers.addLevelSamplers for a vanilla program, and vanilla's uniform blocks; null = the common rules decide. */
+	private Source resolveVanilla(String pass, ShaderResourceLayout.Descriptor d) {
+		String n = d.name();
+		ShaderAttributeInputs in = resolvingVanilla;
+		if (d.kind() == ShaderResourceLayout.Kind.UNIFORM_BUFFER) {
+			return switch (n) {
+				case "iris_DynamicTransforms", "iris_Projection", "iris_Fog", "iris_Globals", "iris_CloudInfo" -> new PassBlock(n.substring("iris_".length()));
+				default -> null;
+			};
+		}
+		if (d.kind() != ShaderResourceLayout.Kind.SAMPLER) return null;
+		return switch (n) {
+			case "tex", "texture", "gtexture", "u_MainSampler" -> in.hasTex() ? new PassSampler("Sampler0") : white();
+			case "gcolor", "colortex0" -> in.hasTex() ? null : white();
+			case "lightmap" -> in.hasLight() ? new PassSampler("Sampler2") : white();
+			case "iris_overlay" -> in.hasOverlay() ? new PassSampler("Sampler1") : white();
+			case "CloudFaces" -> throw new IllegalStateException("clouds' CloudFaces texel buffer (not implemented yet)");
+			default -> null;
+		};
+	}
+
+	/** Iris's white pixel (ExtendedShader binds it where a program has no texture). */
+	private Source white() {
+		return solid("white pixel", 1f, 1f, 1f, 1f);
+	}
+
+	/** What an unassigned sampler reads in a gbuffer program: GL texture unit 0 (the block atlas for Sodium, Sampler0 for vanilla). */
+	private Source unitZero() {
+		if (resolvingVanilla == null) return new Atlas();
+		return resolvingVanilla.hasTex() ? new PassSampler("Sampler0") : white();
+	}
+
 	private Source resolve(String pass, ShaderResourceLayout.Descriptor d, TextureStage stage, Set<Integer> used, Set<Integer> flippedOnce) {
 		String n = d.name();
+		if (resolvingVanilla != null) {
+			Source s = resolveVanilla(pass, d);
+			if (s != null) return s;
+		}
 		if (d.kind() == ShaderResourceLayout.Kind.UNIFORM_BUFFER) {
 			if (n.equals(ShaderResourceLayout.UNIFORM_BLOCK)) return new UniformBlock();
 			if (resolvingGbuffer && n.equals("iris_ChunkData")) return new ChunkData();
@@ -930,8 +1412,8 @@ final class PostChain implements AutoCloseable {
 			// program the name stays unassigned and reads texture unit 0, the block atlas (unless a custom texture claims it)
 			var gbufferTextures = set.getPack().getCustomTextureDataMap().get(stage);
 			if (gbufferTextures == null || aliases(target).stream().noneMatch(gbufferTextures::containsKey)) {
-				notes.add(pass + ": " + n + " is not sampleable in gbuffers on Iris (colortex0-3); reads the block atlas like GL texture unit 0");
-				return new Atlas();
+				notes.add(pass + ": " + n + " is not sampleable in gbuffers on Iris (colortex0-3); reads GL texture unit 0 (albedo)");
+				return unitZero();
 			}
 		}
 		var perStage = set.getPack().getCustomTextureDataMap().get(stage);
@@ -979,8 +1461,8 @@ final class PostChain implements AutoCloseable {
 		if (custom != null) return customTexture(pass, n, custom, d.type());
 		if (resolvingGbuffer && d.type().equalsIgnoreCase("sampler2D")) {
 			// GL: an unassigned sampler reads texture unit 0, which Iris's Sodium path binds to the block atlas
-			notes.add(pass + ": sampler " + n + " is unassigned in Iris; reads the block atlas like GL texture unit 0");
-			return new Atlas();
+			notes.add(pass + ": sampler " + n + " is unassigned in Iris; reads GL texture unit 0 (albedo)");
+			return unitZero();
 		}
 		if (d.type().equalsIgnoreCase("sampler2D")) {
 			// GL: a sampler nobody assigned reads texture unit 0, which Iris's composite passes bind to colortex0
@@ -1276,6 +1758,7 @@ final class PostChain implements AutoCloseable {
 		if (finalPass != null && !slotFree(finalPass)) return false;
 		for (Compute c : setup) if (!slotFree(c.slotSubmit)) return false;
 		for (Gbuffer g : terrain) if (g != null && !slotFree(g.slotSubmit)) return false;
+		for (Vanilla v : vanilla.values()) if (!slotFree(v.slotSubmit)) return false;
 		return true;
 	}
 
@@ -1672,6 +2155,20 @@ final class PostChain implements AutoCloseable {
 					}
 					case ChunkData c -> {
 					}
+					case PassBlock pb -> {
+					}
+					// vanilla's own textures (Polydium keeps them in GENERAL, written in earlier passes behind its full barriers)
+					case PassSampler ps -> {
+						GpuImage img = passState.texture(ps.name());
+						if (img == null) {
+							notes.add("a vanilla pass bound no " + ps.name() + "; the program reads Iris's white pixel");
+							images[i] = ((Fixed) white()).image();
+							sampler[i] = samplers.get(SamplerCache.NEAREST_CLAMP);
+						} else {
+							images[i] = img;
+							sampler[i] = passState.sampler(ps.name());
+						}
+					}
 				}
 			}
 			// an image that is both sampled and a storage image in one program stays in GENERAL, which serves both
@@ -1710,6 +2207,11 @@ final class PostChain implements AutoCloseable {
 						}
 						// Sodium's ChunkData: ivec4 u_chunkFades[64] (std140), the same buffer Iris binds on GL
 						case ChunkData c -> w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, chunkData, 0, 64 * 16);
+						case PassBlock pb -> {
+							long[] blk = passState.block(pb.name());
+							if (blk == null) throw new IllegalStateException("the vanilla pass set no " + pb.name() + " uniform block");
+							w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, blk[0], blk[1], blk[2]);
+						}
 						case TargetImage t -> w.storageImage(b.binding(), images[i]);
 						case Ssbo sb -> w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sb.buffer().buffer(), 0, VK_WHOLE_SIZE);
 						case CustomImage ci -> {
@@ -1827,6 +2329,7 @@ final class PostChain implements AutoCloseable {
 		if (finalPass != null) finalPass.program.close();
 		computePrograms.forEach(ComputeProgram::close);
 		for (Gbuffer g : terrain) if (g != null && g.program != null) g.program.close();
+		for (Vanilla v : vanilla.values()) for (GraphicsProgram[] arr : v.variants.values()) for (GraphicsProgram p : arr) if (p != null) p.close();
 		MemoryUtil.memFree(push);
 		if (sceneCopy != null) sceneCopy.close();
 		if (centerDepthProgram != null) centerDepthProgram.close();

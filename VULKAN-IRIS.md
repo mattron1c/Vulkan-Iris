@@ -20,7 +20,7 @@ Instead of wrapping OpenGL, it borrows the Vulkan device of the renderer that ow
 | 4 | Resources: VMA, render targets, layouts, descriptors, deferred destruction | passed (13 GPU tests + in-game) |
 | 5 | Shader packs → SPIR-V: Iris patcher → Vulkan GLSL → shaderc | 275 / 275 programs from 10 packs |
 | 6 | Native post chain (setup / begin / prepare / deferred / composite / final, compute, custom images) on the live frame | 10 / 10 packs render in-world |
-| 7 | gbuffers + shadow pass (the world drawn with the pack's shaders) | 7a+7b: terrain drawn with the pack's gbuffers programs, 10 / 10 packs ([status](docs/vulkan-iris/PHASE7_STATUS.md)); 7c entities/sky/hand, 7d shadows next |
+| 7 | gbuffers + shadow pass (the world drawn with the pack's shaders) | 7a+7b+7c: terrain, entities, block entities, sky and particles drawn with the pack's gbuffers programs, 10 / 10 packs ([status](docs/vulkan-iris/PHASE7_STATUS.md)); clouds, hand and 7d shadows next |
 | later | shadowcomp, DH/Voxy, VulkanMod adapter, native Vulkan in Minecraft 26.x, other loaders and clients | planned |
 
 Tested so far on an NVIDIA RTX 5060 (driver 610.88), Minecraft 1.21.11, Fabric, Polydium 1.4.21.
@@ -29,9 +29,9 @@ AMD, Intel and integrated GPUs are targets, but **have not been tested yet**.
 Packs used for testing: Bliss, BSL, Complementary Reimagined and Unbound, MakeUp UltraFast, Mellow, miniature, Noble,
 Sildur's Vibrant and Solas. These packs are not part of this repository.
 
-| Vanilla (Polydium) | BSL, terrain gbuffers + post chain on Vulkan |
+| Vanilla (Polydium) | BSL: terrain, entities, sky and post chain on Vulkan |
 |---|---|
-| ![vanilla](docs/vulkan-iris/phase7/vanilla.png) | ![BSL](docs/vulkan-iris/phase7/bsl.png) |
+| ![vanilla](docs/vulkan-iris/phase7/vanilla.png) | ![BSL](docs/vulkan-iris/phase7/7c-bsl.png) |
 
 ## Layout
 - `vulkan/`: the Vulkan core (`dev.vulkaniris.vk`), plain Java 21 + LWJGL. Unit-tested on the real GPU with `gradlew :vulkan:test`.

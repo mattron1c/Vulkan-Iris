@@ -1,7 +1,9 @@
 package dev.vulkaniris.fabric;
 
 import com.google.common.collect.ImmutableList;
+import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import net.irisshaders.iris.pipeline.programs.ShaderKey;
 import dev.vulkaniris.vk.DeferredDestroyer;
 import dev.vulkaniris.vk.DescriptorRing;
 import dev.vulkaniris.vk.FrameClock;
@@ -248,10 +250,38 @@ public final class PostChainCheck {
 		}
 		Files.createDirectories(outDir());
 		var mc = Minecraft.getInstance();
+		if (GBUFFERS) placeScene(mc);
 		line("Backend: " + PolydiumAccess.backendDescription());
 		line("World '" + WORLD + "', player at " + mc.player.blockPosition().toShortString() + ", day time " + mc.level.getDayTime()
 			+ ", main target " + mc.getMainRenderTarget().width + "x" + mc.getMainRenderTarget().height);
 		line(packs.size() + " pack(s): " + packs.stream().map(p -> p.getFileName().toString()).toList());
+	}
+
+	/**
+	 * Phase 7c: entities and a block entity in front of the camera, so the vanilla draws have something to draw. Plain
+	 * vanilla commands on the integrated server; earlier runs' entities (tag vi7c) are removed first.
+	 */
+	private static void placeScene(Minecraft mc) {
+		var server = mc.getSingleplayerServer();
+		if (server == null) return;
+		String[] commands = {
+			"kill @e[tag=vi7c]",
+			"execute as @p at @p run summon pig ^-1.5 ^ ^4 {NoAI:1b,Tags:[\"vi7c\"]}",
+			"execute as @p at @p run summon sheep ^1.5 ^ ^5 {NoAI:1b,Tags:[\"vi7c\"]}",
+			"execute as @p at @p run summon armor_stand ^ ^ ^3.5 {Tags:[\"vi7c\"],ShowArms:1b}",
+			"execute as @p at @p run setblock ^0.5 ^ ^2.5 chest"
+		};
+		run(mc, commands);
+		line("scene: summoned a pig, a sheep and an armor stand and placed a chest in front of the player");
+	}
+
+	private static void run(Minecraft mc, String... commands) {
+		var server = mc.getSingleplayerServer();
+		if (server == null) return;
+		server.execute(() -> {
+			var source = server.createCommandSourceStack().withSuppressedOutput();
+			for (String c : commands) server.getCommands().performPrefixedCommand(source, c);
+		});
 	}
 
 	private static Path outDir() {
@@ -266,6 +296,8 @@ public final class PostChainCheck {
 		recordNanos = 0;
 		line("");
 		line("== " + packName);
+		// Phase 7: same time of day for every pack's screenshot (the daylight cycle keeps running during the test)
+		if (GBUFFERS) run(Minecraft.getInstance(), "time set noon");
 		FileSystem zip = null;
 		long t0 = System.nanoTime();
 		try {
@@ -323,7 +355,7 @@ public final class PostChainCheck {
 		// passes colortex0 through without gbuffer data (miniature) legitimately reproduces the scene
 		int distinct = distinctColours(rgba);
 		boolean flat = distinct < 16;
-		boolean pass = !flat && !(GBUFFERS && terrainFailed);
+		boolean pass = !flat && !(GBUFFERS && (terrainFailed || vanillaFailed));
 		line(packFrames + " frames recorded" + (skippedFrames > 0 ? " (" + skippedFrames + " skipped: uniform slot still in flight)" : "")
 			+ ", CPU record time " + String.format("%.2f", recordNanos / 1e6 / Math.max(1, packFrames)) + " ms/frame (not a benchmark)");
 		line("output: " + st + ", differs from vanilla in " + (100L * differing / total) + "% of pixels");
@@ -335,6 +367,11 @@ public final class PostChainCheck {
 		allPassed &= pass;
 		if (chain.hasTerrain()) line("terrain: " + terrainPasses + " terrain passes drawn with the pack's programs over " + (rebuildFrames + packFrames)
 			+ " frames; " + chain.staleRegions() + " region draws skipped while chunks were still in the old vertex format");
+		if (chain.hasTerrain()) {
+			line("vanilla: " + (VanillaHook.redirectedPasses() - vanillaPassesAtStart) + " Polydium world passes redirected; draws per pack program "
+				+ chain.vanillaDraws());
+			line("  vanilla draws seen while the pack was active: " + VanillaHook.takeSeen());
+			if (!chain.unmappedPipelines().isEmpty()) line("  vanilla pipelines with no Iris mapping (drawn by Polydium): " + new java.util.TreeSet<>(chain.unmappedPipelines()));		}
 		stopTerrain();
 		// this frame's command buffer (not submitted yet) may already hold the chain's terrain draws: destroy it only
 		// once that submission has finished
@@ -400,12 +437,16 @@ public final class PostChainCheck {
 		terrainFailed = false;
 		WorldRenderingSettings.INSTANCE.setVertexFormat(chain.vertexFormat());
 		TerrainHook.sink = PostChainCheck::drawTerrain;
+		vanillaFailed = false;
+		vanillaPassesAtStart = VanillaHook.redirectedPasses();
+		VanillaHook.sink = VANILLA_SINK;
 		Minecraft.getInstance().levelRenderer.allChanged();
 		line("terrain programs active; chunks rebuilding in the pack's vertex format (stride "
 			+ chain.vertexFormat().getVertexFormat().getStride() + " bytes)");
 	}
 
 	private static void stopTerrain() {
+		VanillaHook.sink = null;
 		if (TerrainHook.sink == null) return;
 		TerrainHook.sink = null;
 		WorldRenderingSettings.INSTANCE.setVertexFormat(ChunkMeshFormats.COMPACT);
@@ -437,6 +478,73 @@ public final class PostChainCheck {
 			allPassed = false;
 		}
 		return true;
+	}
+
+	// ------------------------------------------------------------------ Phase 7c: vanilla geometry
+	private static boolean vanillaFailed;
+	private static long vanillaPassesAtStart;
+
+	/** VanillaHook.Sink: vanilla draws Polydium records into the main target during the world, drawn with the pack. */
+	private static final VanillaHook.Sink VANILLA_SINK = new VanillaHook.Sink() {
+		@Override
+		public boolean active() {
+			return chain != null && chain.hasTerrain() && chain.levelBegun() && !vanillaFailed;
+		}
+
+		@Override
+		public ShaderKey key(RenderPipeline pipeline) {
+			return chain.vanillaKey(pipeline);
+		}
+
+		@Override
+		public void draw(VkCommandBuffer cmd, ShaderKey key, RenderPipeline pipeline, PostChain.PassState state, boolean depth, boolean indexed,
+						 int a, int b, int c, int d, int e) {
+			chain.drawVanilla(cmd, tracker, key, pipeline, state, depth, indexed, a, b, c, d, e);
+		}
+
+		@Override
+		public void end(VkCommandBuffer cmd) {
+			if (chain != null) chain.endVanilla(cmd);
+		}
+
+		@Override
+		public void failed(Throwable t) {
+			vanillaFailed = true;
+			allPassed = false;
+			Iris.logger.error("[Vulkan Iris] phase 7c vanilla draw failed", t);
+			line("FAIL: vanilla draw: " + t);
+		}
+	};
+
+	/**
+	 * LevelRenderer.renderLevel HEAD: the sky is drawn before terrain, so the pack's frame has to begin here for the
+	 * sky programs to have their targets (on GL Iris begins its pipeline at the same point).
+	 */
+	public static void beforeLevel() {
+		if (!ENABLED || done || ctx == null || chain == null || !chain.hasTerrain() || chain.levelBegun() || readbackSubmit >= 0
+			|| PolydiumAccess.inRenderPass()) return;
+		try {
+			RenderTarget main = Minecraft.getInstance().getMainRenderTarget();
+			if (main.width != width || main.height != height) return;
+			VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
+			PolydiumAccess.polydiumBarrier(cmd);
+			chain.beginLevel(cmd, tracker, mainColor(main), mainDepth(main), depthAttachment(main));
+			PolydiumAccess.polydiumBarrier(cmd);
+		} catch (Throwable t) {
+			Iris.logger.error("[Vulkan Iris] phase 7 beginLevel failed", t);
+			fail("beginLevel: " + t);
+		}
+	}
+
+	private static GpuImage mainColor(RenderTarget main) {
+		return GpuImage.external("main colour", PolydiumAccess.vkImage(main.getColorTexture()),
+			PolydiumAccess.vkImageView(main.getColorTextureView()), PolydiumAccess.vkFormat(main.getColorTexture()), main.width, main.height,
+			VK_IMAGE_ASPECT_COLOR_BIT, PolydiumAccess.TEXTURE_LAYOUT);
+	}
+
+	private static GpuImage mainDepth(RenderTarget main) {
+		return GpuImage.external("main depth", PolydiumAccess.vkImage(main.getDepthTexture()), depthView(main),
+			PolydiumAccess.vkFormat(main.getDepthTexture()), main.width, main.height, VK_IMAGE_ASPECT_DEPTH_BIT, PolydiumAccess.TEXTURE_LAYOUT);
 	}
 
 	/** Polydium's own view of the main depth (all aspects), for drawing into it. */

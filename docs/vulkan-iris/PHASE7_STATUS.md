@@ -1,4 +1,7 @@
-# Phase 7 — terrain gbuffers: status (slices 7a + 7b)
+# Phase 7 — gbuffers: status (slices 7a + 7b + 7c)
+
+7a + 7b (terrain) are below; 7c (entities, block entities, sky, particles) is at the end:
+[Slice 7c](#slice-7c--vanilla-geometry-with-the-packs-programs).
 
 **Result: on Polydium's live in-world frame, 10 / 10 real shader packs draw the world's terrain with their own
 `gbuffers_terrain` / `_cutout` / `gbuffers_water` programs, natively on Vulkan.** Their deferred / composite / final
@@ -96,8 +99,11 @@ same regions and batches Polydium would. These facts were read from Polydium's b
   past its end. None occurred in the tests.
 
 ## Not implemented yet (reported in the notes, never faked)
-- **7c:** entities, block entities, hand, sky, clouds, particles and weather are not drawn into the gbuffers yet.
-  Packs draw their own sky in deferred/composite, so outdoor scenes look right except for the missing entities and particles.
+- **7c leftovers** (see the 7c section below):
+  - clouds: the `CloudFaces` texel buffer isn't bound yet, so clouds stay with Polydium (packs draw their own in composite)
+  - the hand: Iris draws it in its own pass after the world (`HandRenderer`), not ported
+  - Iris's extended entity vertex format (`iris_Entity`, entity `mc_midTexCoord` / `at_tangent`) reads GL's default (0,0,0,1)
+  - Iris's synthesized fallback shader for keys a pack has no program for
 - **7d:** no shadow pass: `shadow*` samplers are a "nothing occludes" stand-in, and `shadowcomp` doesn't run.
 - **depthtex in gbuffers:** depthtex0/1/2 read the depth before translucent terrain. In the opaque passes that is the previous frame's copy.
   GL would sample the depth buffer being drawn.
@@ -107,3 +113,59 @@ same regions and batches Polydium would. These facts were read from Polydium's b
 - **Validation:** the Khronos validation layer has still not been run (not installed on the test machine).
   Only NVIDIA has been tested.
 - **No benchmark yet.** The test's CPU record times (0.1–2.7 ms per frame for the whole chain) are not a benchmark.
+
+# Slice 7c — vanilla geometry with the pack's programs
+
+**Result:** entities, block entities, the sky (sky disc, sunrise/sunset, stars, sun and moon), particles and the entity
+shadow decal are now drawn with the pack's `gbuffers_entities` / `_block` / `_skybasic` / `_skytextured` / `_textured(_lit)`
+programs into the colortex targets, on Polydium's live frame. **10 / 10 packs pass** `prodPhase7` with no vanilla draw
+error. Over 330 frames each pack draws about 3,000–3,300 entity draws, 660–1,650 sky draws and 330–420 particle draws
+with its own programs (miniature: none, see below), in about 5,000–5,600 redirected Polydium passes. `prodPhase6` still passes 10 / 10. The run exits with 0 images leaked.
+Screenshots were checked by eye; every pack is set to noon at its start.
+
+| BSL | Complementary Reimagined | Noble |
+|---|---|---|
+| ![BSL](phase7/7c-bsl.png) | ![Complementary](phase7/7c-complementary-reimagined.png) | ![Noble](phase7/7c-noble.png) |
+
+More: [Bliss](phase7/7c-bliss.png), [Solas](phase7/7c-solas.png), [Sildur's](phase7/7c-sildurs.png). Not every pack
+has every program; Iris's fallback chain decides which one draws, e.g. Sildur's draws entities with `gbuffers_textured`
+and Solas the sky with `gbuffers_basic`.
+
+**Gap found:** when a pack has no program anywhere in a key's fallback chain, Iris draws with its own synthesized
+fallback shader. That fallback isn't implemented on Vulkan yet. Those draws stay with Polydium, in the main colour, which
+the pack's final pass overwrites. So in miniature, particles, the sun and the moon are missing. The notes list every
+affected key per pack.
+
+The test now summons a pig, a sheep and an armor stand and places a chest in front of the player (vanilla commands
+on the integrated server; earlier runs' entities, tagged `vi7c`, are removed first). The report lists, per pack, the
+draws per pack program and every vanilla pipeline seen while the pack was active.
+
+## How it works
+- **Which program:** Iris's own mapping, `IrisPipelines.getPipeline(pipeline)` → `ShaderKey`, then Iris's
+  `ProgramFallbackResolver` for that key's program. Each key is patched with Iris's `patchVanilla`, translated with
+  `VulkanGlslTranslator` and compiled once per pack; pipeline variants (vertex format, blend, depth, cull) are built at
+  a pipeline's first draw.
+- **Where it hooks** (facts read from Polydium 1.4.21's bytecode; nothing copied):
+  - `VulkanCommandEncoder.createRenderPass(descriptor)` and `VulkanDeferral.continueSuspendedPass(descriptor)` — Polydium
+    merges consecutive passes on the same targets, so most world passes come from the second one. A pass is redirected
+    when its single colour attachment is Minecraft's main colour and its depth (if any) the main depth.
+  - `VulkanRenderPass.drawIndexed(IIIII)` / `draw(IIII)`: every non-indirect draw ends in one of these.
+- **The swap:** at the first redirected draw Polydium's dynamic-rendering scope is ended. The same draw (same vertex and
+  index buffers, same `vkCmdDraw*` arguments, same `DynamicTransforms` / `Projection` / `Fog` / `Globals` uniform blocks and
+  the bound textures) is recorded with the pack's pipeline into its `DRAWBUFFERS` + the main depth. Before Polydium's next own
+  draw, multi-draw, indirect draw, push constant or `close()`, its scope is begun again with the same attachments
+  (load/store), its pipeline, viewport and scissor re-bound and its `VulkanDynamicState` cache reset.
+- **Sky:** Polydium draws the sky with its own far-plane copies of vanilla's sky pipelines (public constants in
+  `SkyFarPlane.Pipelines`). They are mapped back to the vanilla pipeline they replace, so the pack's sky programs run
+  with vanilla's state, as on GL.
+- **Frame start:** the pack's frame now begins at `LevelRenderer.renderLevel` HEAD, because the sky is drawn before terrain.
+- **Inputs vanilla formats don't have** (e.g. `iris_UV1` for particles, `mc_Entity`) read a constant vertex binding
+  with GL's default attribute value (0,0,0,1), as GL does for a disabled attribute.
+
+## Limits (all reported in the notes)
+- clouds, the hand, Iris's extended entity attributes: see "Not implemented yet" above
+- no block entity vs entity phase tracking yet (Iris's `blockEntityId` / `entityId` uniforms are not driven)
+- a program that samples a target it draws into reads a copy taken at its first draw of the frame
+- the uniform block is filled once per program per frame
+- performance items, not measured: one descriptor set per draw; pipeline variants built lazily at first use
+  (a stutter the first time a pipeline is seen); legacy (non-dynamic-rendering) Polydium passes are not handled

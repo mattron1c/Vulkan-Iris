@@ -26,7 +26,10 @@
     "MixinLocalPlayerPort",
     "MixinRenderRegionArenasPort",
     "MixinRenderSectionManagerPort",
-    "MixinSodiumVulkanPort"
+    "MixinSodiumVulkanPort",
+    "MixinVulkanCommandEncoderPort",
+    "MixinVulkanDeferralPort",
+    "MixinVulkanRenderPassPort"
   ],
   "injectors": {
     "defaultRequire": 1

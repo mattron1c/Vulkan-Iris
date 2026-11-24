@@ -92,6 +92,11 @@ public final class LayoutTracker {
 		return use(img, use, false);
 	}
 
+	/** True when {@link #flush} would emit a barrier (callers inside a render pass must end it first). */
+	public boolean hasPending() {
+		return !pending.isEmpty();
+	}
+
 	/** Emits all pending barriers as one {@code vkCmdPipelineBarrier}. No-op when nothing is pending. */
 	public void flush(VkCommandBuffer cmd) {
 		if (pending.isEmpty()) return;
