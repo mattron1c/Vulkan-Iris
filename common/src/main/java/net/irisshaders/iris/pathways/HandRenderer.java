@@ -166,12 +166,19 @@ public class HandRenderer {
 		ACTIVE = false;
 	}
 
+	/**
+	 * Vulkan Iris: on Polydium's Vulkan backend Iris's mixins are stripped, so the hand pass is driven by Vulkan Iris's own
+	 * port (dev.vulkaniris.fabric.VulkanHand). It sets these while it draws, so IrisPipelines maps the hand's pipelines to
+	 * the gbuffers_hand programs exactly as it does for this class on GL.
+	 */
+	public static volatile boolean vulkanActive, vulkanSolid;
+
 	public boolean isActive() {
-		return ACTIVE;
+		return ACTIVE || vulkanActive;
 	}
 
 	public boolean isRenderingSolid() {
-		return renderingSolid;
+		return renderingSolid || vulkanSolid;
 	}
 
 	public void destroy() {

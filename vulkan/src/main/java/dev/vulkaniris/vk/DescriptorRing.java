@@ -70,10 +70,12 @@ public final class DescriptorRing implements AutoCloseable {
 			return oldest.pool();
 		}
 		try (MemoryStack stack = stackPush()) {
-			VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(4, stack);
+			VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(5, stack);
+			sizes.get(4).type(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER).descriptorCount(MAX_SETS);
 			sizes.get(0).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(MAX_SETS * 8);
 			sizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(MAX_SETS);
-			sizes.get(2).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(MAX_SETS);
+			// vanilla gbuffer programs bind vanilla's uniform blocks (DynamicTransforms, Projection, Fog, Globals ...) + their own
+			sizes.get(2).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(MAX_SETS * 6);
 			sizes.get(3).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(MAX_SETS);
 			LongBuffer lp = stack.mallocLong(1);
 			VkCheck.check(vkCreateDescriptorPool(device, VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()

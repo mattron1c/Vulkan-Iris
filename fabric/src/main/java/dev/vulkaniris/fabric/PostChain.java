@@ -9,6 +9,7 @@ import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import net.irisshaders.iris.gl.state.ShaderAttributeInputs;
 import net.irisshaders.iris.pipeline.IrisPipelines;
+import net.irisshaders.iris.pipeline.fallback.ShaderSynthesizer;
 import net.irisshaders.iris.pipeline.programs.ShaderKey;
 import net.irisshaders.iris.uniforms.VanillaUniforms;
 import dev.vulkaniris.vk.ComputeProgram;
@@ -21,6 +22,8 @@ import dev.vulkaniris.vk.GpuBuffer;
 import dev.vulkaniris.vk.GpuImage;
 import dev.vulkaniris.vk.GraphicsProgram;
 import dev.vulkaniris.vk.LayoutTracker;
+import dev.vulkaniris.vk.VkCheck;
+import java.nio.LongBuffer;
 import dev.vulkaniris.vk.RenderTargetSet;
 import dev.vulkaniris.vk.SamplerCache;
 import dev.vulkaniris.vk.ShaderCompiler;
@@ -164,6 +167,10 @@ final class PostChain implements AutoCloseable {
 	}
 
 	/** Depth before translucent terrain: depthtex1/2 in composites, every depthtex in gbuffers (see notes). */
+	/** depthtex2: the depth before the hand (Iris renderTargets.copyPreHandDepth, at beginHand). */
+	private record DepthNoHand() implements Source {
+	}
+
 	private record DepthNoTranslucent() implements Source {
 	}
 
@@ -529,7 +536,7 @@ final class PostChain implements AutoCloseable {
 		for (ShaderResourceLayout.Descriptor desc : layout.descriptors()) {
 			int type = switch (desc.kind()) {
 				case UNIFORM_BUFFER -> VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-				case SAMPLER -> VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+				case SAMPLER -> desc.type().endsWith("samplerBuffer") ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 				case IMAGE -> VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 				case STORAGE_BUFFER -> VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 			};
@@ -793,7 +800,7 @@ final class PostChain implements AutoCloseable {
 			terrain[k] = g;
 		}
 		notes.add("terrain drawn with the pack's programs (" + terrain[0].name + ", " + terrain[1].name + ", " + terrain[2].name
-			+ "), vertex stride " + stride + "; the hand and clouds are not drawn into the gbuffers yet");
+			+ "), vertex stride " + stride);
 	}
 
 	/** Iris BlendModeOverride (GL blend factors) as a Vulkan blend; OFF = no blending. */
@@ -853,6 +860,31 @@ final class PostChain implements AutoCloseable {
 
 	/** A vanilla uniform block ({@code iris_<name>} in the patched program) that the render pass set. */
 	private record PassBlock(String name) implements Source {
+	}
+
+	/** A texel buffer the vanilla pass set as a uniform (clouds' {@code CloudFaces}: R8I), read through our own buffer view. */
+	private record PassTexel(String name, int format) implements Source {
+	}
+
+	private final Map<List<Long>, Long> texelViews = new HashMap<>();
+
+	private long texelView(long buffer, long offset, long range, int format) {
+		List<Long> key = List.of(buffer, offset, range, (long) format);
+		Long v = texelViews.get(key);
+		if (v != null) return v;
+		if (texelViews.size() >= 32) {
+			// the buffer moved (e.g. clouds rebuilt): drop the old views once the frames using them are done
+			List<Long> old = new ArrayList<>(texelViews.values());
+			destroyer.defer("texel buffer views", () -> old.forEach(x -> vkDestroyBufferView(ctx.device(), x, null)));
+			texelViews.clear();
+		}
+		try (MemoryStack s = MemoryStack.stackPush()) {
+			LongBuffer lp = s.mallocLong(1);
+			VkCheck.check(vkCreateBufferView(ctx.device(), VkBufferViewCreateInfo.calloc(s).sType$Default().buffer(buffer).format(format)
+				.offset(offset).range(range), null, lp), "vkCreateBufferView");
+			texelViews.put(key, lp.get(0));
+			return lp.get(0);
+		}
 	}
 
 	/** A vanilla sampler (Sampler0 albedo, Sampler1 overlay, Sampler2 lightmap) that the render pass bound. */
@@ -916,6 +948,10 @@ final class PostChain implements AutoCloseable {
 			return d;
 		});
 		vanillaWriter.override("iris_ProjMatInverse", () -> mat4(new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferProjection()).invert()));
+		// FallbackShader's own uniforms: the key's alpha reference (set per program before its uniforms are written) and fog
+		vanillaWriter.override("AlphaTestValue", () -> new double[]{CapturedRenderingState.INSTANCE.getCurrentAlphaTest()});
+		vanillaWriter.override("FogDensity", () -> new double[]{Math.max(0f, CapturedRenderingState.INSTANCE.getFogDensity())});
+		vanillaWriter.override("FogIsExp2", () -> new double[]{CapturedRenderingState.INSTANCE.getFogDensity() >= 0 ? 1 : 0});
 		vanillaWriter.attachCustom(customUniforms);
 	}
 
@@ -923,9 +959,7 @@ final class PostChain implements AutoCloseable {
 	private static boolean isVanillaKey(ShaderKey k) {
 		if (k.isShadow()) return false;
 		return switch (k) {
-			// hand programs: Iris draws the hand in its own pass after the world (HandRenderer), which isn't ported yet
-			case HAND_CUTOUT, HAND_CUTOUT_BRIGHT, HAND_CUTOUT_DIFFUSE, HAND_TEXT, HAND_TEXT_TRANSLUCENT, HAND_TEXT_INTENSITY,
-				 HAND_TRANSLUCENT, HAND_WATER_BRIGHT, HAND_WATER_DIFFUSE -> false;
+			// hand programs: drawn inside the world by VulkanHand (Iris's HandRenderer port), like on GL
 			// other mods' formats, and Sodium's own clouds
 			case IE_COMPAT, MEKANISM_FLAME, CLOUDS_SODIUM -> false;
 			default -> true;
@@ -943,7 +977,12 @@ final class PostChain implements AutoCloseable {
 			if (!isVanillaKey(key)) continue;
 			Optional<ProgramSource> found = resolver.resolve(key.getProgram());
 			if (found.isEmpty()) {
-				vanillaFailures.put(key, "no program in the pack's fallback chain (Iris would use its synthesized fallback shader; not implemented yet)");
+				try {
+					vanilla.put(key, buildFallbackProgram(compiler, key, used));
+					fallbacks.add(key.getName());
+				} catch (RuntimeException e) {
+					vanillaFailures.put(key, "Iris's synthesized fallback shader: " + e.getMessage());
+				}
 				continue;
 			}
 			ProgramSource src = found.get();
@@ -954,10 +993,64 @@ final class PostChain implements AutoCloseable {
 			}
 		}
 		for (var e : vanillaFailures.entrySet()) notes.add("gbuffers " + e.getKey().getName() + ": not drawn with the pack (" + e.getValue() + ")");
+		if (!fallbacks.isEmpty()) notes.add("no pack program in the fallback chain, drawn with Iris's synthesized fallback shader (colortex0): " + fallbacks);
 		int[] constants = {0, 0, 0, Float.floatToIntBits(1f), 0, 0, 0, 1};
 		constantAttributes = buffer("GL default vertex attributes", 32, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
 		MemoryUtil.memIntBuffer(constantAttributes.mapped(), constants.length).put(constants);
 		alloc.flush(constantAttributes);
+	}
+
+	private final List<String> fallbacks = new ArrayList<>();
+
+	/**
+	 * Iris IrisRenderingPipeline.createFallbackShader / ShaderCreator.createFallback: when no program in the key's fallback
+	 * chain exists, Iris synthesizes one (ShaderSynthesizer — Iris's own code, used as is) that writes colortex0 only.
+	 * Its loose uniforms (AlphaTestValue, FogDensity, FogIsExp2) are FallbackShader's, set the same way.
+	 */
+	private Vanilla buildFallbackProgram(ShaderCompiler compiler, ShaderKey key, Set<Integer> used) {
+		Vanilla v = new Vanilla();
+		v.key = key;
+		v.name = "fallback (" + key.getName() + ")";
+		v.alphaTest = key.getAlphaTest().reference();
+		ShaderAttributeInputs inputs = new ShaderAttributeInputs(key.getVertexFormat(), key.shouldIgnoreLightmap(), false, key == ShaderKey.GLINT,
+			key.isText(), false);
+		boolean isLeash = key.getVertexFormat() == com.mojang.blaze3d.vertex.DefaultVertexFormat.POSITION_COLOR_LIGHTMAP;
+		String vsh = ShaderSynthesizer.vsh(true, inputs, key.getFogMode(), key.hasDiffuseLighting(), isLeash);
+		// GLSL uniform initializers (FallbackShader always sets both before drawing): the values come from the uniform writer
+		String fsh = ShaderSynthesizer.fsh(inputs, key.getFogMode(), key.getAlphaTest(), key.isIntensity(), isLeash)
+			.replace("uniform float FogDensity = 1.0;", "uniform float FogDensity;").replace("uniform int FogIsExp2 = 1;", "uniform int FogIsExp2;")
+			// its single output is colortex0 (Iris binds a one-attachment framebuffer); Vulkan needs the location spelled out
+			.replace("out vec4 fragColor;", "layout(location = 0) out vec4 fragColor;");
+		Map<PatchShaderType, String> gl = new EnumMap<>(PatchShaderType.class);
+		gl.put(PatchShaderType.VERTEX, vsh);
+		gl.put(PatchShaderType.FRAGMENT, fsh);
+		var vk = VulkanGlslTranslator.translate(gl, vanillaWriter::provides);
+		v.layout = vk.layout();
+		v.attributes = vk.attributes();
+		for (String u : vanillaWriter.unresolved(v.layout)) notes.add(v.name + ": uniform " + u + " has no Vulkan value yet (zero)");
+		v.drawBuffers = new int[]{0};
+		used.add(0);
+		v.stages = new ArrayList<>();
+		v.spirv = new ArrayList<>();
+		for (var e : vk.sources().entrySet()) {
+			v.stages.add(e.getKey() == PatchShaderType.VERTEX ? GraphicsProgram.Stage.VERTEX : GraphicsProgram.Stage.FRAGMENT);
+			v.spirv.add(compiler.compile(v.name + e.getKey().extension, compilerStage(e.getKey()), e.getValue()));
+		}
+		resolvingGbuffer = true;
+		resolvingVanilla = inputs;
+		try {
+			v.bindings = bindResources(v.name, v.layout, TextureStage.GBUFFERS_AND_SHADOW, used, Set.of(), VK_SHADER_STAGE_ALL_GRAPHICS, v.bounds);
+		} finally {
+			resolvingGbuffer = false;
+			resolvingVanilla = null;
+		}
+		if (v.layout.uniformBufferSize() > 0) {
+			v.stride = alignUp(v.layout.uniformBufferSize(), UBO_ALIGN);
+			v.ubo = buffer(v.name + " uniforms", v.stride * SLOTS, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+		}
+		Arrays.fill(v.slotSubmit, -1);
+		programCount++;
+		return v;
 	}
 
 	private Vanilla buildVanillaProgram(ShaderCompiler compiler, ShaderKey key, ProgramSource src, ProgramFallbackResolver resolver, Set<Integer> used) {
@@ -1050,6 +1143,14 @@ final class PostChain implements AutoCloseable {
 			case "iris_UV2" -> VertexFormatElement.UV2;
 			case "iris_Normal" -> VertexFormatElement.NORMAL;
 			case "iris_LineWidth" -> VertexFormatElement.LINE_WIDTH;
+			// vanilla's own names (Iris's synthesized fallback shader)
+			case "Position" -> VertexFormatElement.POSITION;
+			case "Color" -> VertexFormatElement.COLOR;
+			case "UV0" -> VertexFormatElement.UV0;
+			case "UV1" -> VertexFormatElement.UV1;
+			case "UV2" -> VertexFormatElement.UV2;
+			case "Normal" -> VertexFormatElement.NORMAL;
+			case "LineWidth" -> VertexFormatElement.LINE_WIDTH;
 			default -> null;
 		};
 	}
@@ -1131,11 +1232,12 @@ final class PostChain implements AutoCloseable {
 				continue;
 			}
 			// GL: an attribute the vertex format doesn't supply reads the current value, (0, 0, 0, 1) by default
-			boolean integer = a.getKey().equals("iris_UV1") || a.getKey().equals("iris_UV2") || a.getKey().equals("iris_Entity");
+			boolean integer = a.getKey().equals("iris_UV1") || a.getKey().equals("iris_UV2") || a.getKey().equals("iris_Entity")
+				|| a.getKey().equals("UV1") || a.getKey().equals("UV2");
 			if (e == null && !integer && !Arrays.asList(FLOAT_DEFAULTS).contains(a.getKey())) {
 				throw new IllegalStateException(v.name + " reads vertex attribute " + a.getKey() + " (not implemented yet)");
 			}
-			if (!a.getKey().startsWith("iris_") || a.getKey().equals("iris_Entity")) {
+			if (Arrays.asList(FLOAT_DEFAULTS).contains(a.getKey()) || a.getKey().equals("iris_Entity")) {
 				notes.add(v.name + ": " + a.getKey() + " = GL's default (0,0,0,1): Iris's extended entity vertex format isn't ported yet");
 			}
 			attributes.add(new GraphicsProgram.Attribute(a.getValue(), integer ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -1331,6 +1433,8 @@ final class PostChain implements AutoCloseable {
 		if (d.kind() == ShaderResourceLayout.Kind.UNIFORM_BUFFER) {
 			return switch (n) {
 				case "iris_DynamicTransforms", "iris_Projection", "iris_Fog", "iris_Globals", "iris_CloudInfo" -> new PassBlock(n.substring("iris_".length()));
+				// Iris's synthesized fallback shader uses vanilla's block names
+				case "DynamicTransforms", "Projection", "Fog", "Globals", "Lighting" -> new PassBlock(n);
 				default -> null;
 			};
 		}
@@ -1340,7 +1444,12 @@ final class PostChain implements AutoCloseable {
 			case "gcolor", "colortex0" -> in.hasTex() ? null : white();
 			case "lightmap" -> in.hasLight() ? new PassSampler("Sampler2") : white();
 			case "iris_overlay" -> in.hasOverlay() ? new PassSampler("Sampler1") : white();
-			case "CloudFaces" -> throw new IllegalStateException("clouds' CloudFaces texel buffer (not implemented yet)");
+			// fallback shader (vanilla names; FallbackShader binds units 0/1/2)
+			case "Sampler0" -> in.hasTex() ? new PassSampler("Sampler0") : white();
+			case "Sampler1" -> in.hasOverlay() ? new PassSampler("Sampler1") : white();
+			case "Sampler2" -> in.hasLight() ? new PassSampler("Sampler2") : white();
+			// vanilla CloudRenderer: setUniform("CloudFaces", slice), UniformType.TEXEL_BUFFER, TextureFormat.RED8I
+			case "CloudFaces" -> new PassTexel("CloudFaces", VK_FORMAT_R8_SINT);
 			default -> null;
 		};
 	}
@@ -1434,10 +1543,7 @@ final class PostChain implements AutoCloseable {
 				return new Depth();
 			}
 			case "depthtex1", "depthtex2" -> {
-				if (withGbuffers) {
-					if (n.equals("depthtex2")) notes.add("depthtex2 = depth before translucent terrain (the hand is not drawn into the gbuffers yet)");
-					return new DepthNoTranslucent();
-				}
+				if (withGbuffers) return n.equals("depthtex2") ? new DepthNoHand() : new DepthNoTranslucent();
 				notes.add(n + " = main depth (no separate pre-translucent / pre-hand copy yet)");
 				return new Depth();
 			}
@@ -1771,8 +1877,8 @@ final class PostChain implements AutoCloseable {
 		}
 	}
 
-	private GpuImage mainColor, mainDepth, mainDepthAttachment, depthNoTranslucent;
-	private boolean levelBegun, translucentDone;
+	private GpuImage mainColor, mainDepth, mainDepthAttachment, depthNoTranslucent, depthNoHand;
+	private boolean levelBegun, translucentDone, handCopied;
 	private TerrainInputs terrainInputs;
 	private static final SamplerCache.Key ATLAS_SAMPLER = new SamplerCache.Key(SamplerCache.Filter.NEAREST, SamplerCache.Address.REPEAT, true, false);
 
@@ -1797,6 +1903,7 @@ final class PostChain implements AutoCloseable {
 		this.mainDepthAttachment = depthAttachment;
 		levelBegun = true;
 		translucentDone = false;
+		handCopied = false;
 		segment(cmd, tracker);
 		targets.resize(mainColor.width(), mainColor.height());
 		if (withGbuffers) ensureDepthCopy();
@@ -1855,6 +1962,16 @@ final class PostChain implements AutoCloseable {
 		endSegment();
 	}
 
+	/** Iris beginHand: depthtex2 = the depth of everything opaque except the hand, copied just before the hand pass. */
+	void beforeHand(VkCommandBuffer cmd, LayoutTracker tracker) {
+		if (!levelBegun) throw new IllegalStateException("beforeHand outside the level");
+		if (depthNoHand == null) return;
+		segment(cmd, tracker);
+		copyDepth(mainDepth, depthNoHand);
+		handCopied = true;
+		endSegment();
+	}
+
 	/** After the world: composite, final (into the main colour target) and Iris's copy-back. */
 	void endLevel(VkCommandBuffer cmd, LayoutTracker tracker) {
 		if (!levelBegun) throw new IllegalStateException("endLevel without beginLevel");
@@ -1901,6 +2018,15 @@ final class PostChain implements AutoCloseable {
 			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
 		ownedImages.add(depthNoTranslucent);
 		clearDepth(depthNoTranslucent, 1f);
+		if (depthNoHand != null) {
+			GpuImage old = depthNoHand;
+			ownedImages.remove(old);
+			destroyer.defer("depthtex2 copy", () -> alloc.destroy(old));
+		}
+		depthNoHand = alloc.createImage("depthtex2 (no hand)", mainDepth.format(), mainDepth.width(), mainDepth.height(),
+			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+		ownedImages.add(depthNoHand);
+		clearDepth(depthNoHand, 1f);
 	}
 
 	private void copyDepth(GpuImage src, GpuImage dst) {
@@ -2153,7 +2279,15 @@ final class PostChain implements AutoCloseable {
 						sampler[i] = samplers.get(SamplerCache.NEAREST_CLAMP);
 						sampled.add(images[i]);
 					}
+					case DepthNoHand dh -> {
+						// no hand pass this frame: the pre-translucent copy holds the same depth
+						images[i] = handCopied ? depthNoHand : depthNoTranslucent != null ? depthNoTranslucent : mainDepth;
+						sampler[i] = samplers.get(SamplerCache.NEAREST_CLAMP);
+						sampled.add(images[i]);
+					}
 					case ChunkData c -> {
+					}
+					case PassTexel pt -> {
 					}
 					case PassBlock pb -> {
 					}
@@ -2211,6 +2345,11 @@ final class PostChain implements AutoCloseable {
 							long[] blk = passState.block(pb.name());
 							if (blk == null) throw new IllegalStateException("the vanilla pass set no " + pb.name() + " uniform block");
 							w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, blk[0], blk[1], blk[2]);
+						}
+						case PassTexel pt -> {
+							long[] blk = passState.block(pt.name());
+							if (blk == null) throw new IllegalStateException("the vanilla pass set no " + pt.name() + " texel buffer");
+							w.texelBuffer(b.binding(), texelView(blk[0], blk[1], blk[2], pt.format()));
 						}
 						case TargetImage t -> w.storageImage(b.binding(), images[i]);
 						case Ssbo sb -> w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sb.buffer().buffer(), 0, VK_WHOLE_SIZE);
@@ -2330,6 +2469,8 @@ final class PostChain implements AutoCloseable {
 		computePrograms.forEach(ComputeProgram::close);
 		for (Gbuffer g : terrain) if (g != null && g.program != null) g.program.close();
 		for (Vanilla v : vanilla.values()) for (GraphicsProgram[] arr : v.variants.values()) for (GraphicsProgram p : arr) if (p != null) p.close();
+		for (long view : texelViews.values()) vkDestroyBufferView(ctx.device(), view, null);
+		texelViews.clear();
 		MemoryUtil.memFree(push);
 		if (sceneCopy != null) sceneCopy.close();
 		if (centerDepthProgram != null) centerDepthProgram.close();

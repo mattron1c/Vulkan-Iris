@@ -20,7 +20,7 @@ Instead of wrapping OpenGL, it borrows the Vulkan device of the renderer that ow
 | 4 | Resources: VMA, render targets, layouts, descriptors, deferred destruction | passed (13 GPU tests + in-game) |
 | 5 | Shader packs → SPIR-V: Iris patcher → Vulkan GLSL → shaderc | 275 / 275 programs from 10 packs |
 | 6 | Native post chain (setup / begin / prepare / deferred / composite / final, compute, custom images) on the live frame | 10 / 10 packs render in-world |
-| 7 | gbuffers + shadow pass (the world drawn with the pack's shaders) | 7a+7b+7c: terrain, entities, block entities, sky and particles drawn with the pack's gbuffers programs, 10 / 10 packs ([status](docs/vulkan-iris/PHASE7_STATUS.md)); clouds, hand and 7d shadows next |
+| 7 | gbuffers + shadow pass (the world drawn with the pack's shaders) | 7a+7b+7c: terrain, entities, block entities, sky, particles, clouds and the hand drawn with the pack's gbuffers programs, 10 / 10 packs ([status](docs/vulkan-iris/PHASE7_STATUS.md)); entity IDs and 7d shadows next |
 | later | shadowcomp, DH/Voxy, VulkanMod adapter, native Vulkan in Minecraft 26.x, other loaders and clients | planned |
 
 Tested so far on an NVIDIA RTX 5060 (driver 610.88), Minecraft 1.21.11, Fabric, Polydium 1.4.21.

@@ -45,6 +45,13 @@ public final class DescriptorWrites implements AutoCloseable {
 		return this;
 	}
 
+	/** A uniform texel buffer (GLSL {@code samplerBuffer}/{@code isamplerBuffer}) through a {@code VkBufferView}. */
+	public DescriptorWrites texelBuffer(int binding, long bufferView) {
+		writes.get(n++).sType$Default().dstSet(set).dstBinding(binding).descriptorCount(1)
+			.descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER).pTexelBufferView(stack.longs(bufferView));
+		return this;
+	}
+
 	@Override
 	public void close() {
 		try {

@@ -1,4 +1,4 @@
-# Phase 7 — gbuffers: status (slices 7a + 7b + 7c)
+# Phase 7 — gbuffers: status (slices 7a + 7b + 7c + 7c gaps)
 
 7a + 7b (terrain) are below; 7c (entities, block entities, sky, particles) is at the end:
 [Slice 7c](#slice-7c--vanilla-geometry-with-the-packs-programs).
@@ -99,11 +99,8 @@ same regions and batches Polydium would. These facts were read from Polydium's b
   past its end. None occurred in the tests.
 
 ## Not implemented yet (reported in the notes, never faked)
-- **7c leftovers** (see the 7c section below):
-  - clouds: the `CloudFaces` texel buffer isn't bound yet, so clouds stay with Polydium (packs draw their own in composite)
-  - the hand: Iris draws it in its own pass after the world (`HandRenderer`), not ported
-  - Iris's extended entity vertex format (`iris_Entity`, entity `mc_midTexCoord` / `at_tangent`) reads GL's default (0,0,0,1)
-  - Iris's synthesized fallback shader for keys a pack has no program for
+- **7c leftover:** Iris's extended entity vertex format (`iris_Entity`, entity `mc_midTexCoord` / `at_tangent`) reads GL's
+  default (0,0,0,1), and the `entityId` / `blockEntityId` uniforms are not driven. See "Entity IDs" in the 7c section.
 - **7d:** no shadow pass: `shadow*` samplers are a "nothing occludes" stand-in, and `shadowcomp` doesn't run.
 - **depthtex in gbuffers:** depthtex0/1/2 read the depth before translucent terrain. In the opaque passes that is the previous frame's copy.
   GL would sample the depth buffer being drawn.
@@ -131,10 +128,8 @@ More: [Bliss](phase7/7c-bliss.png), [Solas](phase7/7c-solas.png), [Sildur's](pha
 has every program; Iris's fallback chain decides which one draws, e.g. Sildur's draws entities with `gbuffers_textured`
 and Solas the sky with `gbuffers_basic`.
 
-**Gap found:** when a pack has no program anywhere in a key's fallback chain, Iris draws with its own synthesized
-fallback shader. That fallback isn't implemented on Vulkan yet. Those draws stay with Polydium, in the main colour, which
-the pack's final pass overwrites. So in miniature, particles, the sun and the moon are missing. The notes list every
-affected key per pack.
+**Gap found (closed in 7c gaps, below):** when a pack has no program anywhere in a key's fallback chain, Iris draws
+with its own synthesized fallback shader. Without it, miniature was missing particles, the sun and the moon.
 
 The test now summons a pig, a sheep and an armor stand and places a chest in front of the player (vanilla commands
 on the integrated server; earlier runs' entities, tagged `vi7c`, are removed first). The report lists, per pack, the
@@ -163,9 +158,54 @@ draws per pack program and every vanilla pipeline seen while the pack was active
   with GL's default attribute value (0,0,0,1), as GL does for a disabled attribute.
 
 ## Limits (all reported in the notes)
-- clouds, the hand, Iris's extended entity attributes: see "Not implemented yet" above
-- no block entity vs entity phase tracking yet (Iris's `blockEntityId` / `entityId` uniforms are not driven)
+- Iris's extended entity attributes and the `entityId` / `blockEntityId` uniforms: see "Entity IDs" below
 - a program that samples a target it draws into reads a copy taken at its first draw of the frame
 - the uniform block is filled once per program per frame
 - performance items, not measured: one descriptor set per draw; pipeline variants built lazily at first use
   (a stutter the first time a pipeline is seen); legacy (non-dynamic-rendering) Polydium passes are not handled
+
+# 7c gaps — fallback shader, clouds, hand
+
+**Result:** `prodPhase7` passes **10 / 10** packs. Over 330 frames:
+- every pack draws the clouds with its own program, 331 draws each (`gbuffers_clouds`; BSL uses `gbuffers_textured`)
+- every pack draws the hand with its own program, 331 hand passes each (`gbuffers_hand`, `gbuffers_hand_water`)
+- miniature draws 10 keys with Iris's synthesized fallback shader, including particles, the sun and the moon
+
+`prodPhase6` passes 10 / 10, and `:vulkan:test` passes 11 / 11. The test now puts a diamond sword in the main hand and
+light-blue stained glass in the off hand, so the solid and the translucent hand are both drawn.
+
+| BSL | Complementary Reimagined | miniature (fallback shader) |
+|---|---|---|
+| ![BSL](phase7/7c-gaps-bsl.png) | ![Complementary](phase7/7c-gaps-complementary-reimagined.png) | ![miniature](phase7/7c-gaps-miniature.png) |
+
+## How it works
+- **Fallback shader.** When `ProgramFallbackResolver` finds nothing for a key, Iris's own
+  `ShaderSynthesizer.vsh/fsh` builds the program, with the same inputs Iris passes on GL: the key's vertex format,
+  lightmap, glint, text, fog mode, diffuse lighting and leash. The synthesized fragment shader writes colortex0 only.
+  - Its vanilla names (Position, Color, UV0–UV2, Normal, LineWidth) map to the vertex format.
+  - Its uniform blocks map to the pass's blaze3d blocks: Projection, DynamicTransforms, Globals, Fog, Lighting.
+  - `Sampler0–2` map to the pass's textures.
+  - The loose uniforms `AlphaTestValue`, `FogDensity` and `FogIsExp2` come from Iris's `CapturedRenderingState`.
+  - The one change made for Vulkan is an explicit `layout(location = 0)` on `fragColor`, because SPIR-V requires one.
+- **Clouds.** Vanilla 1.21.11 reads cloud cells from a `samplerBuffer` (`CloudFaces`, `R8_SINT`). Packs now see it as a
+  `VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER` whose buffer view covers the same buffer slice. Views are cached per buffer,
+  offset, range and format, and destroyed deferred, once the frames that use them have finished.
+- **Hand.** This is a port of Iris's `HandRenderer` as `VulkanHand` (LGPL-3.0, credit: the Iris team), with Iris's injection points:
+  - the solid hands at the main pass's second `endBatch`, after a depth copy for `depthtex2` (depth without the hand)
+  - the translucent hands at the end of the level
+  - vanilla's own hand pass after the level is skipped
+
+  The hands go through the same redirect as other vanilla draws. Iris's `HandRenderer.isActive()` and
+  `isRenderingSolid()` also report the Vulkan hand, so Iris's `gbuffers_hand` / `_hand_water` mapping picks the right programs.
+
+## Entity IDs (not done: documented, not faked)
+Iris writes per-vertex entity, block entity and item IDs (`iris_Entity`) and entity `mc_midTexCoord` / `at_tangent`
+through an extended vertex format. It needs three things:
+- a `BufferBuilder` mixin that widens `NEW_ENTITY` / `BLOCK` / `POSITION_COLOR_TEX_LIGHTMAP` buffers
+- a `RenderPipeline.getVertexFormat` mixin
+- about 15 mixins that track the entity currently rendered
+
+Porting it on Polydium is not a contained change. The widened buffers would also reach the Polydium pipelines this
+fork doesn't redirect, such as GUI items, and those still expect vanilla's vertex layout. An ID per draw is not an
+option either: entities are batched by render type, so one draw holds many entities. Until this is ported, the
+attributes read GL's default (0,0,0,1) and every affected program says so in the notes.

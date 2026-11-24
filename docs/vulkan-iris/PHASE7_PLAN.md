@@ -25,7 +25,7 @@ renders the shadow maps. Once that works, packs render as they do on Iris and pe
    - Translation reuses Iris's `patchSodium` → `VulkanGlslTranslator`.
    - Output goes to the colortex MRT plus the main depth.
    - Then deferred runs on real gbuffer data: no more scene copy into colortex0, and depthtex1 comes from a pre-translucent depth copy.
-3. **7c: other geometry.** *(done for entities, block entities, sky and particles: 10 / 10 packs, see [PHASE7_STATUS.md](PHASE7_STATUS.md#slice-7c--vanilla-geometry-with-the-packs-programs); still open: clouds, the hand, Iris's fallback shader, extended entity attributes)* Swap vanilla `RenderPipeline`s on `VulkanRenderPass` for pack programs, using Iris's own `IrisPipelines` mapping:
+3. **7c: other geometry.** *(done for entities, block entities, sky and particles: 10 / 10 packs, see [PHASE7_STATUS.md](PHASE7_STATUS.md#slice-7c--vanilla-geometry-with-the-packs-programs); clouds, the hand and Iris's fallback shader followed in "7c gaps"; still open: extended entity attributes / entity IDs)* Swap vanilla `RenderPipeline`s on `VulkanRenderPass` for pack programs, using Iris's own `IrisPipelines` mapping:
    - `gbuffers_entities`, `_block`, `_hand`, `_skybasic`, `_skytextured`, `_clouds`, `_particles`, `_weather`, `_basic`, `_textured`, `_beaconbeam`, `_armor_glint`, `_spidereyes`
    - plus Iris's `entityId`/`blockEntityId` uniforms
 4. **7d: shadow pass.**

@@ -269,7 +269,10 @@ public final class PostChainCheck {
 			"execute as @p at @p run summon pig ^-1.5 ^ ^4 {NoAI:1b,Tags:[\"vi7c\"]}",
 			"execute as @p at @p run summon sheep ^1.5 ^ ^5 {NoAI:1b,Tags:[\"vi7c\"]}",
 			"execute as @p at @p run summon armor_stand ^ ^ ^3.5 {Tags:[\"vi7c\"],ShowArms:1b}",
-			"execute as @p at @p run setblock ^0.5 ^ ^2.5 chest"
+			"execute as @p at @p run setblock ^0.5 ^ ^2.5 chest",
+			// solid hand (sword) and translucent hand (stained glass) for VulkanHand's two passes
+			"item replace entity @p weapon.mainhand with minecraft:diamond_sword",
+			"item replace entity @p weapon.offhand with minecraft:light_blue_stained_glass"
 		};
 		run(mc, commands);
 		line("scene: summoned a pig, a sheep and an armor stand and placed a chest in front of the player");
@@ -370,6 +373,7 @@ public final class PostChainCheck {
 		if (chain.hasTerrain()) {
 			line("vanilla: " + (VanillaHook.redirectedPasses() - vanillaPassesAtStart) + " Polydium world passes redirected; draws per pack program "
 				+ chain.vanillaDraws());
+			line("  hand passes (pre-hand depth copy + solid hand): " + handPasses);
 			line("  vanilla draws seen while the pack was active: " + VanillaHook.takeSeen());
 			if (!chain.unmappedPipelines().isEmpty()) line("  vanilla pipelines with no Iris mapping (drawn by Polydium): " + new java.util.TreeSet<>(chain.unmappedPipelines()));		}
 		stopTerrain();
@@ -440,6 +444,8 @@ public final class PostChainCheck {
 		vanillaFailed = false;
 		vanillaPassesAtStart = VanillaHook.redirectedPasses();
 		VanillaHook.sink = VANILLA_SINK;
+		handPasses = 0;
+		VulkanHand.enabled = VANILLA_SINK::active;
 		Minecraft.getInstance().levelRenderer.allChanged();
 		line("terrain programs active; chunks rebuilding in the pack's vertex format (stride "
 			+ chain.vertexFormat().getVertexFormat().getStride() + " bytes)");
@@ -447,6 +453,7 @@ public final class PostChainCheck {
 
 	private static void stopTerrain() {
 		VanillaHook.sink = null;
+		VulkanHand.enabled = () -> false;
 		if (TerrainHook.sink == null) return;
 		TerrainHook.sink = null;
 		WorldRenderingSettings.INSTANCE.setVertexFormat(ChunkMeshFormats.COMPACT);
@@ -535,6 +542,22 @@ public final class PostChainCheck {
 			fail("beginLevel: " + t);
 		}
 	}
+
+	/** Iris beginHand (main pass, before the solid hand): the pre-hand depth copy for depthtex2. */
+	public static void beforeHand() {
+		if (chain == null || !VANILLA_SINK.active() || PolydiumAccess.inRenderPass()) return;
+		try {
+			VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
+			PolydiumAccess.polydiumBarrier(cmd);
+			chain.beforeHand(cmd, tracker);
+			PolydiumAccess.polydiumBarrier(cmd);
+			handPasses++;
+		} catch (Throwable t) {
+			VANILLA_SINK.failed(t);
+		}
+	}
+
+	private static long handPasses;
 
 	private static GpuImage mainColor(RenderTarget main) {
 		return GpuImage.external("main colour", PolydiumAccess.vkImage(main.getColorTexture()),

@@ -9,4 +9,14 @@ import org.spongepowered.asm.mixin.gen.Invoker;
 public interface GameRendererAccessorPort {
 	@Invoker("shouldRenderBlockOutline")
 	boolean vulkaniris$shouldRenderBlockOutline();
+
+	// Iris GameRendererAccessor's hand-pass invokers (HandRenderer.setupGlState), for VulkanHand
+	@Invoker("bobView")
+	void vulkaniris$bobView(com.mojang.blaze3d.vertex.PoseStack poseStack, float tickDelta);
+
+	@Invoker("bobHurt")
+	void vulkaniris$bobHurt(com.mojang.blaze3d.vertex.PoseStack poseStack, float tickDelta);
+
+	@Invoker("getFov")
+	float vulkaniris$getFov(net.minecraft.client.Camera camera, float tickDelta, boolean useFovSetting);
 }
