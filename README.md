@@ -1,3 +1,17 @@
+# Vulkan Iris
+
+**A fork of Iris that runs OptiFine/Iris shader packs on a native Vulkan backend.** There is no OpenGL wrapping and no
+silent fallback to GL. Packs are compiled to SPIR-V and drawn with real Vulkan pipelines on the game's own Vulkan device.
+
+> **Work in progress — not usable for playing yet.** Shader packs currently run their post-processing chain natively,
+> but the world itself is not yet drawn with the pack's shaders (that is Phase 7). See [VULKAN-IRIS.md](VULKAN-IRIS.md)
+> for status, test results, roadmap and build instructions.
+
+Everything below this line is the original Iris README, kept for credit. Vulkan Iris is not affiliated with or
+supported by the Iris team. Please don't report Vulkan Iris bugs to them.
+
+---
+
 ![Iris: An open-source shaders mod compatible with OptiFine shader packs](docs/banner.png)
 
 # Iris

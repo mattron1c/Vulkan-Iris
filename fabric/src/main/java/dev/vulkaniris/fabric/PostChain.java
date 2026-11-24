@@ -2,6 +2,7 @@ package dev.vulkaniris.fabric;
 
 import com.google.common.collect.ImmutableMap;
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import dev.vulkaniris.vk.ComputeProgram;
 import dev.vulkaniris.vk.DescriptorRing;
 import dev.vulkaniris.vk.DescriptorWrites;
 import dev.vulkaniris.vk.DeferredDestroyer;
@@ -23,10 +24,15 @@ import net.irisshaders.iris.pipeline.transform.TransformPatcher;
 import net.irisshaders.iris.pipeline.transform.vulkan.VulkanGlslTranslator;
 import net.irisshaders.iris.pipeline.vulkan.VulkanUniformWriter;
 import net.irisshaders.iris.shaderpack.loading.ProgramArrayId;
+import net.irisshaders.iris.shaderpack.materialmap.BlockMaterialMapping;
+import net.irisshaders.iris.shaderpack.materialmap.WorldRenderingSettings;
 import net.irisshaders.iris.shaderpack.loading.ProgramId;
+import net.irisshaders.iris.shaderpack.ImageInformation;
+import net.irisshaders.iris.shaderpack.programs.ComputeSource;
 import net.irisshaders.iris.shaderpack.programs.ProgramSet;
 import net.irisshaders.iris.shaderpack.programs.ProgramSource;
 import net.irisshaders.iris.shaderpack.properties.PackDirectives;
+import net.irisshaders.iris.shaderpack.properties.IndirectPointer;
 import net.irisshaders.iris.shaderpack.properties.PackRenderTargetDirectives;
 import net.irisshaders.iris.shaderpack.texture.CustomTextureData;
 import net.irisshaders.iris.shaderpack.texture.TextureStage;
@@ -35,7 +41,9 @@ import net.irisshaders.iris.uniforms.CommonUniforms;
 import net.irisshaders.iris.uniforms.FrameUpdateNotifier;
 import net.irisshaders.iris.uniforms.SystemTimeUniforms;
 import net.irisshaders.iris.uniforms.custom.CustomUniforms;
+import org.joml.Vector2f;
 import org.joml.Vector3d;
+import org.joml.Vector3i;
 import org.joml.Vector4f;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -46,6 +54,8 @@ import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.lwjgl.vulkan.VK10.*;
 
@@ -120,13 +130,35 @@ final class PostChain implements AutoCloseable {
 	private record CenterDepth() implements Source {
 	}
 
+	/** A pack custom image ({@code image.<name>} in shaders.properties): storage image by name, sampler by samplerName. */
+	private record CustomImage(GpuImage image, boolean integer) implements Source {
+	}
+
 	private record Bound(int binding, Source source) {
+	}
+
+	/** One Iris compute program ({@code <pass>.csh}, {@code <pass>_a.csh} ...), dispatched before its pass. */
+	private static final class Compute {
+		String name;
+		ComputeProgram program;
+		ShaderResourceLayout layout;
+		List<Bound> bounds = new ArrayList<>();
+		GpuBuffer ubo;
+		long stride;
+		final long[] slotSubmit = new long[SLOTS];
+		int[] localSize;
+		Vector3i workGroups;
+		Vector2f relative;
+		IndirectPointer indirect;
+		Ssbo indirectBuffer;
 	}
 
 	private static final class Pass {
 		String name;
 		boolean isFinal;
+		/** null for a compute-only pass (Iris ComputeOnlyPass: compute programs at an index with no fragment program). */
 		GraphicsProgram program;
+		List<Compute> computes = new ArrayList<>();
 		ShaderResourceLayout layout;
 		List<Bound> bounds = new ArrayList<>();
 		int[] drawBuffers = new int[0];
@@ -158,6 +190,9 @@ final class PostChain implements AutoCloseable {
 	private final CustomUniforms customUniforms;
 	private final Map<Stage, List<Pass>> passes = new LinkedHashMap<>();
 	private Pass finalPass;
+	private List<Compute> setup = List.of();
+	private boolean setupDone;
+	private final List<ComputeProgram> computePrograms = new ArrayList<>();
 	private GraphicsProgram sceneCopy;
 	private RenderTargetSet targets;
 	private final InternalTextureFormat[] targetFormats = new InternalTextureFormat[RenderTargetSet.MAX_TARGETS];
@@ -181,6 +216,13 @@ final class PostChain implements AutoCloseable {
 		this.set = set;
 		this.directives = set.getPackDirectives();
 		this.mainColorFormat = mainColorFormat;
+
+		// IrisRenderingPipeline: the pack's id maps (block ids are read by uniforms like currentSelectedBlockId)
+		var idMap = set.getPack().getIdMap();
+		WorldRenderingSettings.INSTANCE.setEntityIds(idMap.getEntityIdMap());
+		WorldRenderingSettings.INSTANCE.setItemIds(idMap.getItemIdMap());
+		WorldRenderingSettings.INSTANCE.setBlockStateIds(BlockMaterialMapping.createBlockStateIdMap(idMap.getBlockProperties(), idMap.getTagEntries()));
+		WorldRenderingSettings.INSTANCE.setBlockTypeIds(BlockMaterialMapping.createBlockTypeMap(idMap.getBlockRenderTypeMap()));
 
 		// Iris's uniforms, exactly as IrisRenderingPipeline + CompositeRenderer register them
 		this.customUniforms = set.getPack().customUniforms.build(
@@ -213,23 +255,49 @@ final class PostChain implements AutoCloseable {
 		Set<Integer> used = new TreeSet<>();
 		used.add(0);
 		Set<Integer> flippedOnce = new HashSet<>();
+		// Iris IrisRenderingPipeline: setup programs run once, before everything else
+		this.setup = buildComputes(compiler, set.getSetup(), TextureStage.SETUP, used, Set.of());
 		for (Stage st : STAGES) {
 			flippedOnce = new HashSet<>(); // Iris: one CompositeRenderer per stage, each with its own flippedAtLeastOnce
 			List<Pass> list = new ArrayList<>();
-			for (ProgramSource src : set.getComposite(st.array())) {
-				if (src == null || !src.isValid()) continue;
-				list.add(build(compiler, src, st.stage(), false, used, flippedOnce));
+			ProgramSource[] sources = set.getComposite(st.array());
+			ComputeSource[][] computes = set.getCompute(st.array());
+			for (int i = 0; i < Math.max(sources.length, computes.length); i++) {
+				ProgramSource src = i < sources.length ? sources[i] : null;
+				ComputeSource[] cs = i < computes.length ? computes[i] : null;
+				// Iris CompositeRenderer: an index's computes see the same flippedAtLeastOnce snapshot as its fragment program
+				List<Compute> built = buildComputes(compiler, cs, st.stage(), used, Set.copyOf(flippedOnce));
+				if (src == null || !src.isValid()) {
+					if (!built.isEmpty()) {
+						Pass p = new Pass();
+						p.name = built.get(0).name;
+						p.computes = built;
+						list.add(p);
+					}
+					continue;
+				}
+				Pass p = build(compiler, src, st.stage(), false, used, flippedOnce);
+				p.computes = built;
+				list.add(p);
 			}
 			passes.put(st, list);
 		}
 		final Set<Integer> afterComposite = flippedOnce; // FinalPassRenderer gets the composite stage's set
+		List<Compute> finalComputes = buildComputes(compiler, set.getFinalCompute(), TextureStage.COMPOSITE_AND_FINAL, used, Set.copyOf(afterComposite));
 		this.finalPass = set.get(ProgramId.Final).filter(ProgramSource::isValid)
 			.map(src -> build(compiler, src, TextureStage.COMPOSITE_AND_FINAL, true, used, afterComposite)).orElse(null);
-		if (finalPass == null) notes.add("pack has no final pass: the last colortex0 is copied to the screen (Iris does the same)");
-		for (ProgramArrayId a : List.of(ProgramArrayId.Begin, ProgramArrayId.Prepare, ProgramArrayId.Deferred, ProgramArrayId.Composite)) {
-			var c = set.getCompute(a);
-			if (c != null && Arrays.stream(c).anyMatch(x -> x != null && Arrays.stream(x).anyMatch(Objects::nonNull))) notes.add("compute passes in " + a + " are skipped (not implemented yet)");
+		if (finalPass != null) {
+			finalPass.computes = finalComputes;
+		} else {
+			notes.add("pack has no final pass: the last colortex0 is copied to the screen (Iris does the same)");
+			if (!finalComputes.isEmpty()) {
+				Pass p = new Pass();
+				p.name = "final compute";
+				p.computes = finalComputes;
+				passes.get(STAGES.get(STAGES.size() - 1)).add(p);
+			}
 		}
+		buildCustomImages();
 
 		int[] formats = new int[RenderTargetSet.MAX_TARGETS];
 		for (int i : used) formats[i] = VkFormats.of(targetFormats[i]);
@@ -317,20 +385,8 @@ final class PostChain implements AutoCloseable {
 			}
 		}
 
-		List<GraphicsProgram.Binding> bindings = new ArrayList<>();
-		for (ShaderResourceLayout.Descriptor desc : p.layout.descriptors()) {
-			int type = switch (desc.kind()) {
-				case UNIFORM_BUFFER -> VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-				case SAMPLER -> VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-				case IMAGE -> VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-				case STORAGE_BUFFER -> VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-			};
-			if (desc.count() != 1) throw new IllegalStateException(p.name + ": array of " + desc.name() + " (not implemented yet)");
-			bindings.add(new GraphicsProgram.Binding(desc.name(), desc.binding(), type, 1, VK_SHADER_STAGE_ALL_GRAPHICS));
-			Source source = resolve(p.name, desc, stage, used, flippedOnce);
-			if (source instanceof Ssbo) p.usesSsbo = true;
-			p.bounds.add(new Bound(desc.binding(), source));
-		}
+		List<GraphicsProgram.Binding> bindings = bindResources(p.name, p.layout, stage, used, flippedOnce, VK_SHADER_STAGE_ALL_GRAPHICS, p.bounds);
+		p.usesSsbo = p.bounds.stream().anyMatch(b -> b.source() instanceof Ssbo);
 
 		if (!isFinal) {
 			for (int b : p.drawBuffers) if (p.explicitFlips.get(b) != Boolean.FALSE) flippedOnce.add(b);
@@ -359,6 +415,153 @@ final class PostChain implements AutoCloseable {
 		return p;
 	}
 
+	private List<GraphicsProgram.Binding> bindResources(String name, ShaderResourceLayout layout, TextureStage stage, Set<Integer> used,
+														Set<Integer> flippedOnce, int stageFlags, List<Bound> out) {
+		List<GraphicsProgram.Binding> bindings = new ArrayList<>();
+		for (ShaderResourceLayout.Descriptor desc : layout.descriptors()) {
+			int type = switch (desc.kind()) {
+				case UNIFORM_BUFFER -> VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+				case SAMPLER -> VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+				case IMAGE -> VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+				case STORAGE_BUFFER -> VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			};
+			if (desc.count() != 1) throw new IllegalStateException(name + ": array of " + desc.name() + " (not implemented yet)");
+			bindings.add(new GraphicsProgram.Binding(desc.name(), desc.binding(), type, 1, stageFlags));
+			if (desc.kind() == ShaderResourceLayout.Kind.IMAGE) storageBindings.computeIfAbsent(out, k -> new BitSet()).set(out.size());
+			out.add(new Bound(desc.binding(), resolve(name, desc, stage, used, flippedOnce)));
+		}
+		return bindings;
+	}
+
+	private static final Pattern LOCAL_SIZE = Pattern.compile("layout\\s*\\(([^)]*local_size_[xyz][^)]*)\\)\\s*in\\s*;");
+	private static final Pattern LOCAL_SIZE_PART = Pattern.compile("local_size_([xyz])\\s*=\\s*([^,\\s)]+)");
+
+	/** GL_COMPUTE_WORK_GROUP_SIZE, read from the shader's own {@code layout(local_size_*) in;} (each axis defaults to 1, as in GLSL). */
+	static int[] localSize(String name, String glsl) {
+		int[] size = {1, 1, 1};
+		Matcher m = LOCAL_SIZE.matcher(glsl);
+		boolean found = false;
+		while (m.find()) {
+			found = true;
+			Matcher part = LOCAL_SIZE_PART.matcher(m.group(1));
+			while (part.find()) {
+				int axis = part.group(1).charAt(0) - 'x';
+				try {
+					size[axis] = Integer.decode(part.group(2).replaceAll("[uU]$", ""));
+				} catch (NumberFormatException e) {
+					throw new IllegalStateException(name + ": local_size_" + part.group(1) + " = " + part.group(2) + " is not a constant number (not implemented yet)");
+				}
+			}
+		}
+		if (!found) throw new IllegalStateException(name + ": compute shader declares no layout(local_size_*) in");
+		return size;
+	}
+
+	private List<Compute> buildComputes(ShaderCompiler compiler, ComputeSource[] sources, TextureStage stage, Set<Integer> used, Set<Integer> flippedOnce) {
+		List<Compute> out = new ArrayList<>();
+		if (sources == null) return out;
+		for (ComputeSource src : sources) {
+			if (src == null || src.getSource().isEmpty()) continue;
+			Compute c = new Compute();
+			c.name = src.getName();
+			String gl = TransformPatcher.patchCompute(c.name, src.getSource().get(), stage, directives.getTextureMap());
+			var vk = VulkanGlslTranslator.translate(Map.of(PatchShaderType.COMPUTE, gl), writer::provides);
+			c.layout = vk.layout();
+			for (String u : writer.unresolved(c.layout)) notes.add(c.name + ": uniform " + u + " has no Vulkan value yet (zero)");
+			String translated = vk.sources().get(PatchShaderType.COMPUTE);
+			c.localSize = localSize(c.name, translated);
+			byte[] spirv = compiler.compile(c.name + ".csh", ShaderCompiler.Stage.COMPUTE, translated);
+			List<GraphicsProgram.Binding> bindings = bindResources(c.name, c.layout, stage, used, flippedOnce, VK_SHADER_STAGE_COMPUTE_BIT, c.bounds);
+			c.program = new ComputeProgram(ctx.device(), c.name, spirv, bindings);
+			computePrograms.add(c.program);
+			if (c.layout.uniformBufferSize() > 0) {
+				c.stride = alignUp(c.layout.uniformBufferSize(), UBO_ALIGN);
+				c.ubo = buffer(c.name + " uniforms", c.stride * SLOTS, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+			}
+			c.workGroups = src.getWorkGroups();
+			c.relative = src.getWorkGroupRelative();
+			c.indirect = src.getIndirectPointer();
+			if (c.indirect != null) c.indirectBuffer = ssbo(c.name, c.indirect.buffer(), "indirect dispatch");
+			Arrays.fill(c.slotSubmit, -1);
+			programCount++;
+			out.add(c);
+		}
+		return out;
+	}
+
+	/** Iris ComputeProgram.getWorkGroups. */
+	private static Vector3i workGroups(Compute c, float width, float height) {
+		if (c.workGroups != null) return c.workGroups;
+		if (c.relative != null) {
+			return new Vector3i((int) Math.ceil(Math.ceil(width * c.relative.x) / c.localSize[0]), (int) Math.ceil(Math.ceil(height * c.relative.y) / c.localSize[1]), 1);
+		}
+		return new Vector3i((int) Math.ceil(width / c.localSize[0]), (int) Math.ceil(height / c.localSize[1]), 1);
+	}
+
+	// ------------------------------------------------------------------ custom images (Iris GlImage)
+
+	private record ImageEntry(ImageInformation info, GpuImage image, boolean integer) {
+	}
+
+	private final Map<String, ImageEntry> customImages = new LinkedHashMap<>();
+
+	private ImageEntry imageEntry(String pass, ImageInformation info) {
+		return customImages.computeIfAbsent(info.name(), k -> {
+			int format = VkFormats.of(info.internalTextureFormat());
+			int usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+			requireStorageFormat(info.name(), format);
+			int w = info.width(), h = info.height(), d = info.depth();
+			if (info.isRelative()) {
+				RenderTarget main = net.minecraft.client.Minecraft.getInstance().getMainRenderTarget();
+				w = (int) (main.width * info.relativeWidth());
+				h = (int) (main.height * info.relativeHeight());
+				notes.add("image " + info.name() + " is screen-relative; sized for " + main.width + "x" + main.height + " and not resized yet");
+			}
+			GpuImage img = switch (info.target()) {
+				case TEXTURE_1D -> alloc.createImage1D("image " + info.name(), format, w, usage);
+				case TEXTURE_2D, TEXTURE_RECTANGLE -> alloc.createImage("image " + info.name(), format, w, h, usage, VK_IMAGE_ASPECT_COLOR_BIT);
+				case TEXTURE_3D -> alloc.createImage3D("image " + info.name(), format, w, h, d, usage);
+			};
+			ownedImages.add(img);
+			boolean integer = VkFormats.isInteger(info.internalTextureFormat());
+			// GL allocates the image with no data; drivers give zeros, and Iris clears "clear" images to 0 every frame anyway
+			uploads.add(() -> clearColor(img, new Vector4f(0f), integer));
+			return new ImageEntry(info, img, integer);
+		});
+	}
+
+	private void requireStorageFormat(String name, int format) {
+		try (MemoryStack s = MemoryStack.stackPush()) {
+			VkFormatProperties props = VkFormatProperties.calloc(s);
+			vkGetPhysicalDeviceFormatProperties(ctx.physicalDevice(), format, props);
+			if ((props.optimalTilingFeatures() & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0) {
+				throw new IllegalStateException("image " + name + ": format " + format + " cannot be a storage image on this GPU");
+			}
+		}
+	}
+
+	/** {@code bySampler}: n is a sampler name (IrisSamplers.addCustomImages), else an image name (IrisImages.addCustomImages). */
+	private CustomImage customImage(String pass, String n, boolean bySampler) {
+		for (ImageInformation info : set.getPack().getIrisCustomImages()) {
+			if (bySampler ? n.equals(info.samplerName()) : n.equals(info.name())) {
+				ImageEntry e = imageEntry(pass, info);
+				return new CustomImage(e.image(), e.integer());
+			}
+		}
+		return null;
+	}
+
+	/** Images the pack declares but no Phase 6 program touches still exist on GL; create them so shadow/gbuffer phases find them. */
+	private void buildCustomImages() {
+		for (ImageInformation info : set.getPack().getIrisCustomImages()) imageEntry("pack", info);
+	}
+
+	private void clearCustomImages() {
+		for (ImageEntry e : customImages.values()) {
+			if (e.info().clear()) clearColor(e.image(), new Vector4f(0f), e.integer());
+		}
+	}
+
 	private Source resolve(String pass, ShaderResourceLayout.Descriptor d, TextureStage stage, Set<Integer> used, Set<Integer> flippedOnce) {
 		String n = d.name();
 		if (d.kind() == ShaderResourceLayout.Kind.UNIFORM_BUFFER) {
@@ -372,7 +575,9 @@ final class PostChain implements AutoCloseable {
 				used.add(i);
 				return new TargetImage(i);
 			}
-			throw new IllegalStateException(pass + ": image " + n + " (custom images not implemented yet)");
+			CustomImage ci = customImage(pass, n, false);
+			if (ci != null) return ci;
+			throw new IllegalStateException(pass + ": image " + n + " is neither colorimgN nor a pack image (shadowcolorimg needs the shadow pass, not implemented yet)");
 		}
 		// Iris CustomTextureSamplerInterceptor: this stage's custom textures win over built-in names, except a colortex
 		// (or its legacy alias) that an earlier pass of the stage already wrote
@@ -412,12 +617,8 @@ final class PostChain implements AutoCloseable {
 			notes.add(n + " bound to a 1x1 'no shadow' stand-in (shadow pass not implemented yet)");
 			return dummy(d.type(), 1f); // depth 1.0 = nothing occludes; colour 1.0 = untinted
 		}
-		for (var image : set.getPack().getIrisCustomImages()) {
-			if (n.equals(image.samplerName()) || n.equals(image.name())) {
-				throw new IllegalStateException(pass + ": samples pack custom image '" + image.name() + "' (" + image.target()
-					+ "), written by the pack's compute passes — custom images and compute are not implemented yet");
-			}
-		}
+		CustomImage sampledImage = customImage(pass, n, true);
+		if (sampledImage != null) return sampledImage;
 		CustomTextureData custom = set.getPack().getIrisCustomTextureDataMap().get(n);
 		if (custom != null) return customTexture(pass, n, custom, d.type());
 		if (d.type().equalsIgnoreCase("sampler2D")) {
@@ -436,16 +637,20 @@ final class PostChain implements AutoCloseable {
 	private Ssbo ssbo(String pass, ShaderResourceLayout.Descriptor d) {
 		Integer index = d.originalBinding();
 		if (index == null) throw new IllegalStateException(pass + ": buffer block " + d.name() + " has no layout(binding = N)");
+		return ssbo(pass, index, "buffer block " + d.name());
+	}
+
+	private Ssbo ssbo(String pass, int index, String what) {
 		return ssbos.computeIfAbsent(index, i -> {
 			var info = set.getPack().getBufferObjects().get((int) i);
-			if (info == null) throw new IllegalStateException(pass + ": buffer block " + d.name() + " uses binding " + i + " but the pack defines no bufferObject." + i);
+			if (info == null) throw new IllegalStateException(pass + ": " + what + " uses buffer " + i + " but the pack defines no bufferObject." + i);
 			long size = info.size();
 			if (info.relative()) {
 				RenderTarget main = net.minecraft.client.Minecraft.getInstance().getMainRenderTarget();
 				size = (long) Math.ceil(main.width * info.scaleX()) * (long) Math.ceil(main.height * info.scaleY()) * info.size();
 				notes.add("bufferObject." + i + " is screen-relative; sized for " + main.width + "x" + main.height + " and not resized yet");
 			}
-			GpuBuffer buf = alloc.createBuffer("bufferObject." + i, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+			GpuBuffer buf = alloc.createBuffer("bufferObject." + i, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
 			ownedBuffers.add(buf);
 			byte[] content = info.content();
 			final long fSize = size;
@@ -468,14 +673,19 @@ final class PostChain implements AutoCloseable {
 		});
 	}
 
-	/** Orders storage-buffer reads/writes of earlier passes (and the initial fill/copy) before this pass. */
-	private void ssboBarrier() {
+	private static final int SHADER_STAGES = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+	/**
+	 * Iris's glMemoryBarrier(SHADER_IMAGE_ACCESS | TEXTURE_FETCH | SHADER_STORAGE) around compute, for buffer memory:
+	 * earlier shader and transfer writes (storage buffers, their initial fill/copy) become visible to the next shaders and
+	 * indirect dispatches. Image hazards and layouts are the LayoutTracker's job.
+	 */
+	private void memoryBarrier() {
 		try (MemoryStack s = MemoryStack.stackPush()) {
 			VkMemoryBarrier.Buffer b = VkMemoryBarrier.calloc(1, s);
 			b.get(0).sType$Default().srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
-				.dstAccessMask(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-				VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, b, null, null);
+				.dstAccessMask(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+			vkCmdPipelineBarrier(cmd, SHADER_STAGES | VK_PIPELINE_STAGE_TRANSFER_BIT, SHADER_STAGES | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, b, null, null);
 		}
 	}
 
@@ -689,8 +899,10 @@ final class PostChain implements AutoCloseable {
 	boolean record(VkCommandBuffer cmd, LayoutTracker tracker, GpuImage mainColor, GpuImage mainDepth) {
 		for (List<Pass> list : passes.values()) for (Pass p : list) if (!slotFree(p)) return false;
 		if (finalPass != null && !slotFree(finalPass)) return false;
+		for (Compute c : setup) if (!slotFree(c.slotSubmit)) return false;
 		this.cmd = cmd;
 		this.tracker = tracker;
+		this.currentDepth = mainDepth;
 		targets.resize(mainColor.width(), mainColor.height());
 		LayoutTracker.releaseExternal(mainColor);
 		LayoutTracker.releaseExternal(mainDepth);
@@ -706,6 +918,15 @@ final class PostChain implements AutoCloseable {
 
 		notifier.onNewFrame();
 		customUniforms.update();
+		clearCustomImages();
+		if (!setupDone) {
+			// Iris: setup programs run once, dispatched as dispatch(1, 1)
+			if (!setup.isEmpty()) {
+				for (Compute c : setup) dispatch(c, 1, 1);
+				memoryBarrier();
+			}
+			setupDone = true;
+		}
 		clearTargets();
 
 		for (var e : passes.entrySet()) {
@@ -731,7 +952,13 @@ final class PostChain implements AutoCloseable {
 	}
 
 	private boolean slotFree(Pass p) {
-		long s = p.slotSubmit[(int) (frame % SLOTS)];
+		if (p.program != null && !slotFree(p.slotSubmit)) return false;
+		for (Compute c : p.computes) if (!slotFree(c.slotSubmit)) return false;
+		return true;
+	}
+
+	private boolean slotFree(long[] slotSubmit) {
+		long s = slotSubmit[(int) (frame % SLOTS)];
 		return s < 0 || clock.isComplete(s);
 	}
 
@@ -800,7 +1027,121 @@ final class PostChain implements AutoCloseable {
 		}
 	}
 
+	/** This frame's images for a program's bindings (flips change which image a colortex name means). */
+	private final class Resolved {
+		final GpuImage[] images;
+		final long[] sampler;
+		final Set<GpuImage> sampled = Collections.newSetFromMap(new IdentityHashMap<>());
+		final Set<GpuImage> storage = Collections.newSetFromMap(new IdentityHashMap<>());
+		boolean usesBuffers;
+
+		Resolved(List<Bound> bounds, GpuImage mainDepth) {
+			images = new GpuImage[bounds.size()];
+			sampler = new long[bounds.size()];
+			for (int i = 0; i < images.length; i++) {
+				switch (bounds.get(i).source()) {
+					case UniformBlock u -> {
+					}
+					case Target t -> {
+						images[i] = targets.read(t.index());
+						sampler[i] = samplers.get(VkFormats.isInteger(targetFormats[t.index()]) ? SamplerCache.NEAREST_CLAMP : SamplerCache.LINEAR_CLAMP);
+						sampled.add(images[i]);
+					}
+					case TargetImage t -> {
+						images[i] = targets.read(t.index());
+						storage.add(images[i]);
+					}
+					case Depth dep -> {
+						images[i] = mainDepth;
+						sampler[i] = samplers.get(SamplerCache.NEAREST_CLAMP);
+						sampled.add(mainDepth);
+					}
+					case Fixed f -> {
+						images[i] = f.image();
+						sampler[i] = samplers.get(f.sampler());
+						sampled.add(f.image());
+					}
+					case Ssbo b -> usesBuffers = true;
+					case CenterDepth c -> {
+						images[i] = centerDepth[centerDepthLatest];
+						sampler[i] = samplers.get(SamplerCache.LINEAR_CLAMP);
+						sampled.add(images[i]);
+					}
+					case CustomImage ci -> {
+						images[i] = ci.image();
+						// GlImage: NEAREST for integer formats, LINEAR otherwise, clamp to edge
+						sampler[i] = samplers.get(ci.integer() ? SamplerCache.NEAREST_CLAMP : SamplerCache.LINEAR_CLAMP);
+						(isStorageBinding(bounds, i) ? storage : sampled).add(images[i]);
+					}
+				}
+			}
+			// an image that is both sampled and a storage image in one program stays in GENERAL, which serves both
+			sampled.removeAll(storage);
+		}
+
+		void declare(LayoutTracker.Use sampledUse, LayoutTracker.Use storageUse) {
+			for (GpuImage img : sampled) tracker.use(img, sampledUse);
+			for (GpuImage img : storage) tracker.use(img, storageUse);
+		}
+
+		void write(long ds, List<Bound> bounds, ShaderResourceLayout layout, GpuBuffer ubo, long stride, int slot) {
+			try (DescriptorWrites w = new DescriptorWrites(ctx.device(), ds, images.length)) {
+				for (int i = 0; i < images.length; i++) {
+					Bound b = bounds.get(i);
+					switch (b.source()) {
+						case UniformBlock u -> {
+							ByteBuffer dst = MemoryUtil.memByteBuffer(ubo.mapped() + slot * stride, layout.uniformBufferSize());
+							writer.write(layout, dst);
+							w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, ubo.buffer(), slot * stride, layout.uniformBufferSize());
+						}
+						case TargetImage t -> w.storageImage(b.binding(), images[i]);
+						case Ssbo sb -> w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sb.buffer().buffer(), 0, VK_WHOLE_SIZE);
+						case CustomImage ci -> {
+							if (isStorageBinding(bounds, i)) w.storageImage(b.binding(), images[i]);
+							else w.image(b.binding(), 0, images[i], sampler[i]);
+						}
+						default -> w.image(b.binding(), 0, images[i], sampler[i]);
+					}
+				}
+			}
+			if (ubo != null) alloc.flush(ubo);
+		}
+	}
+
+	/** Which bindings are storage images, per program: filled at build time from the layout's descriptor kinds. */
+	private final Map<List<Bound>, BitSet> storageBindings = new IdentityHashMap<>();
+
+	private boolean isStorageBinding(List<Bound> bounds, int i) {
+		BitSet bits = storageBindings.get(bounds);
+		return bits != null && bits.get(i);
+	}
+
+	private void dispatch(Compute c, float width, float height) {
+		Resolved r = new Resolved(c.bounds, currentDepth);
+		r.declare(LayoutTracker.Use.SAMPLED_COMPUTE, LayoutTracker.Use.STORAGE_COMPUTE);
+		tracker.flush(cmd);
+		memoryBarrier(); // Iris ComputeProgram.dispatch: a full memory barrier before every dispatch
+		int slot = (int) (frame % SLOTS);
+		long ds = ring.allocate(c.program.setLayout());
+		r.write(ds, c.bounds, c.layout, c.ubo, c.stride, slot);
+		c.slotSubmit[slot] = clock.currentIndex();
+		if (c.indirect != null) {
+			c.program.dispatchIndirect(cmd, ds, c.indirectBuffer.buffer().buffer(), c.indirect.offset());
+		} else {
+			Vector3i g = workGroups(c, width, height);
+			if (g.x > 0 && g.y > 0 && g.z > 0) c.program.dispatch(cmd, ds, g.x, g.y, g.z);
+		}
+	}
+
+	private GpuImage currentDepth;
+
 	private void run(Pass p, GpuImage mainColor, GpuImage mainDepth) {
+		currentDepth = mainDepth;
+		if (!p.computes.isEmpty()) {
+			for (Compute c : p.computes) dispatch(c, mainColor.width(), mainColor.height());
+			memoryBarrier(); // Iris CompositeRenderer: memoryBarrier after a pass's computes
+		}
+		if (p.program == null) return;
 		GpuImage[] outs;
 		if (p.isFinal) {
 			outs = new GpuImage[]{mainColor};
@@ -808,71 +1149,18 @@ final class PostChain implements AutoCloseable {
 			outs = new GpuImage[p.drawBuffers.length];
 			for (int i = 0; i < outs.length; i++) outs[i] = targets.write(p.drawBuffers[i]);
 		}
-		// resolve this frame's images (flips change them), declare every use once, then one barrier batch
-		GpuImage[] images = new GpuImage[p.bounds.size()];
-		long[] sampler = new long[p.bounds.size()];
-		Set<GpuImage> sampled = Collections.newSetFromMap(new IdentityHashMap<>());
-		Set<GpuImage> storage = Collections.newSetFromMap(new IdentityHashMap<>());
-		for (int i = 0; i < images.length; i++) {
-			Source s = p.bounds.get(i).source();
-			switch (s) {
-				case UniformBlock u -> {
-				}
-				case Target t -> {
-					images[i] = targets.read(t.index());
-					sampler[i] = samplers.get(VkFormats.isInteger(targetFormats[t.index()]) ? SamplerCache.NEAREST_CLAMP : SamplerCache.LINEAR_CLAMP);
-					sampled.add(images[i]);
-				}
-				case TargetImage t -> {
-					images[i] = targets.read(t.index());
-					storage.add(images[i]);
-				}
-				case Depth dep -> {
-					images[i] = mainDepth;
-					sampler[i] = samplers.get(SamplerCache.NEAREST_CLAMP);
-					sampled.add(mainDepth);
-				}
-				case Fixed f -> {
-					images[i] = f.image();
-					sampler[i] = samplers.get(f.sampler());
-					sampled.add(f.image());
-				}
-				case Ssbo b -> {
-				}
-				case CenterDepth c -> {
-					images[i] = centerDepth[centerDepthLatest];
-					sampler[i] = samplers.get(SamplerCache.LINEAR_CLAMP);
-					sampled.add(images[i]);
-				}
-			}
-		}
+		Resolved r = new Resolved(p.bounds, mainDepth);
 		for (GpuImage o : outs) {
-			if (sampled.contains(o) || storage.contains(o)) throw new IllegalStateException(p.name + " reads and renders to " + o.name());
+			if (r.sampled.contains(o) || r.storage.contains(o)) throw new IllegalStateException(p.name + " reads and renders to " + o.name());
 		}
-		for (GpuImage img : sampled) tracker.use(img, LayoutTracker.Use.SAMPLED_GRAPHICS);
-		for (GpuImage img : storage) tracker.use(img, LayoutTracker.Use.STORAGE_FRAGMENT);
+		r.declare(LayoutTracker.Use.SAMPLED_GRAPHICS, LayoutTracker.Use.STORAGE_FRAGMENT);
 		for (GpuImage o : outs) tracker.use(o, LayoutTracker.Use.COLOR_ATTACHMENT);
 		tracker.flush(cmd);
-		if (p.usesSsbo) ssboBarrier();
+		if (p.usesSsbo) memoryBarrier();
 
 		int slot = (int) (frame % SLOTS);
 		long ds = ring.allocate(p.program.setLayout());
-		try (DescriptorWrites w = new DescriptorWrites(ctx.device(), ds, images.length)) {
-			for (int i = 0; i < images.length; i++) {
-				Bound b = p.bounds.get(i);
-				switch (b.source()) {
-					case UniformBlock u -> {
-						ByteBuffer dst = MemoryUtil.memByteBuffer(p.ubo.mapped() + slot * p.stride, p.layout.uniformBufferSize());
-						writer.write(p.layout, dst);
-						w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, p.ubo.buffer(), slot * p.stride, p.layout.uniformBufferSize());
-					}
-					case TargetImage t -> w.storageImage(b.binding(), images[i]);
-					case Ssbo sb -> w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sb.buffer().buffer(), 0, VK_WHOLE_SIZE);
-					default -> w.image(b.binding(), 0, images[i], sampler[i]);
-				}
-			}
-		}
-		if (p.ubo != null) alloc.flush(p.ubo);
+		r.write(ds, p.bounds, p.layout, p.ubo, p.stride, slot);
 		p.slotSubmit[slot] = clock.currentIndex();
 		p.program.draw(cmd, ds, outs, quad.buffer(), 6);
 
@@ -919,8 +1207,9 @@ final class PostChain implements AutoCloseable {
 	/** Only once no submission using any of it is pending (callers wait for the queue to idle). */
 	@Override
 	public void close() {
-		for (List<Pass> list : passes.values()) for (Pass p : list) p.program.close();
+		for (List<Pass> list : passes.values()) for (Pass p : list) if (p.program != null) p.program.close();
 		if (finalPass != null) finalPass.program.close();
+		computePrograms.forEach(ComputeProgram::close);
 		if (sceneCopy != null) sceneCopy.close();
 		if (centerDepthProgram != null) centerDepthProgram.close();
 		if (targets != null) targets.close();

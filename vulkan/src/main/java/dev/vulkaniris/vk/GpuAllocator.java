@@ -94,11 +94,22 @@ public final class GpuAllocator implements AutoCloseable {
 		}
 	}
 
-	/** Sampled 3D texture (pack {@code TEXTURE_3D} custom textures). {@link GpuImage#height()} is the y size; depth is the caller's. */
+	/** 3D texture (pack {@code TEXTURE_3D} custom textures and images). {@link GpuImage#height()} is the y size; depth is the caller's. */
 	public GpuImage createImage3D(String name, int format, int width, int height, int depth, int usage) {
+		return createImageDims(name, format, 3, width, height, depth, usage);
+	}
+
+	/** 1D texture (pack {@code TEXTURE_1D} custom images). */
+	public GpuImage createImage1D(String name, int format, int width, int usage) {
+		return createImageDims(name, format, 1, width, 1, 1, usage);
+	}
+
+	private GpuImage createImageDims(String name, int format, int dims, int width, int height, int depth, int usage) {
 		if (width <= 0 || height <= 0 || depth <= 0) throw new IllegalArgumentException(name + ": bad size " + width + "x" + height + "x" + depth);
+		int imageType = dims == 1 ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_3D;
+		int viewType = dims == 1 ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_3D;
 		try (MemoryStack stack = stackPush()) {
-			VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default().imageType(VK_IMAGE_TYPE_3D).format(format)
+			VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default().imageType(imageType).format(format)
 				.extent(e -> e.set(width, height, depth)).mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
 				.tiling(VK_IMAGE_TILING_OPTIMAL).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
 			VmaAllocationCreateInfo aci = VmaAllocationCreateInfo.calloc(stack).usage(VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
@@ -109,7 +120,7 @@ public final class GpuAllocator implements AutoCloseable {
 			long image = pImage.get(0), alloc = pAlloc.get(0);
 			long view;
 			try {
-				VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_3D)
+				VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(viewType)
 					.format(format).subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
 				VkCheck.check(vkCreateImageView(ctx.device(), vci, null, pImage), "vkCreateImageView(" + name + ")");
 				view = pImage.get(0);
