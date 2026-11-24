@@ -698,7 +698,10 @@ public class Iris {
 	 * without keybinds or GL. No-op if Iris already initialised normally.
 	 */
 	public static synchronized void initializeForVulkan() {
-		if (IRIS_VERSION == null) IRIS_VERSION = IrisPlatformHelpers.getInstance().getVersion();
+		if (IRIS_VERSION == null) {
+			IRIS_VERSION = IrisPlatformHelpers.getInstance().getVersion();
+			DHCompat.run(); // decides whether Distant Horizons is present; uniforms (dhRenderDistance…) depend on it
+		}
 		if (irisConfig == null) {
 			irisConfig = new IrisConfig(IrisPlatformHelpers.getInstance().getConfigDir().resolve("iris.properties"),
 				IrisPlatformHelpers.getInstance().getConfigDir().resolve("iris-excluded.json"));

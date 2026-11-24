@@ -180,9 +180,16 @@ public class IrisExclusiveUniforms {
 		return false;
 	}
 
+	/**
+	 * Vulkan Iris: Polydium strips Iris's GameRendererAccessor mixin on Vulkan, and touching the stripped accessor is
+	 * an illegal class load, so the Vulkan backend installs its own accessor here. The default is Iris's.
+	 */
+	public static volatile java.util.function.BooleanSupplier SHOULD_RENDER_BLOCK_OUTLINE =
+		() -> ((GameRendererAccessor) Minecraft.getInstance().gameRenderer).shouldRenderBlockOutlineA();
+
 	private static int getCurrentSelectedBlockId() {
 		HitResult hitResult = Minecraft.getInstance().hitResult;
-		if (Minecraft.getInstance().level != null && ((GameRendererAccessor) Minecraft.getInstance().gameRenderer).shouldRenderBlockOutlineA() && hitResult != null && hitResult.getType() == HitResult.Type.BLOCK) {
+		if (Minecraft.getInstance().level != null && SHOULD_RENDER_BLOCK_OUTLINE.getAsBoolean() && hitResult != null && hitResult.getType() == HitResult.Type.BLOCK) {
 			BlockPos blockPos4 = ((BlockHitResult) hitResult).getBlockPos();
 			BlockState blockState = Minecraft.getInstance().level.getBlockState(blockPos4);
 			if (!blockState.isAir() && Minecraft.getInstance().level.getWorldBorder().isWithinBounds(blockPos4)) {
@@ -195,7 +202,7 @@ public class IrisExclusiveUniforms {
 
 	private static Vector3f getCurrentSelectedBlockPos() {
 		HitResult hitResult = Minecraft.getInstance().hitResult;
-		if (Minecraft.getInstance().level != null && ((GameRendererAccessor) Minecraft.getInstance().gameRenderer).shouldRenderBlockOutlineA() && hitResult != null && hitResult.getType() == HitResult.Type.BLOCK) {
+		if (Minecraft.getInstance().level != null && SHOULD_RENDER_BLOCK_OUTLINE.getAsBoolean() && hitResult != null && hitResult.getType() == HitResult.Type.BLOCK) {
 			BlockPos blockPos4 = ((BlockHitResult) hitResult).getBlockPos();
 			return blockPos4.getCenter().subtract(Minecraft.getInstance().gameRenderer.getMainCamera().position()).toVector3f();
 		}

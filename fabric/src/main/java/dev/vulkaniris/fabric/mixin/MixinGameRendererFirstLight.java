@@ -1,8 +1,10 @@
 package dev.vulkaniris.fabric.mixin;
 
 import dev.vulkaniris.fabric.FirstLight;
-import dev.vulkaniris.fabric.ResourceCheck;
+import dev.vulkaniris.fabric.FrameState;
 import dev.vulkaniris.fabric.PackCompileCheck;
+import dev.vulkaniris.fabric.PostChainCheck;
+import dev.vulkaniris.fabric.ResourceCheck;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;
@@ -16,10 +18,16 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  */
 @Mixin(GameRenderer.class)
 public class MixinGameRendererFirstLight {
+	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V", at = @At("HEAD"))
+	private void vulkaniris$startFrame(DeltaTracker deltaTracker, boolean renderLevel, CallbackInfo ci) {
+		FrameState.startFrame(deltaTracker);
+	}
+
 	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V", at = @At("TAIL"))
 	private void vulkaniris$firstLight(DeltaTracker deltaTracker, boolean renderLevel, CallbackInfo ci) {
 		FirstLight.afterGameRender();
 		ResourceCheck.afterGameRender();
 		PackCompileCheck.afterGameRender();
+		PostChainCheck.afterGameRender();
 	}
 }

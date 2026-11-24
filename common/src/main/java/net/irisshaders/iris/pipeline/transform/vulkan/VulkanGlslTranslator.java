@@ -166,6 +166,16 @@ public final class VulkanGlslTranslator {
 		int binding = UNIFORM_BINDING + 1;
 		for (Resource r : resources.values()) {
 			int b = binding++;
+			// the pack's own layout(binding = N): Iris binds buffer blocks (bufferObject.N) and images by it
+			Integer original = null;
+			for (var q : r.qualifiers) {
+				var part = Glsl.layout(q, "binding");
+				if (part != null && part.getExpression() != null) {
+					int n = Glsl.integer(part.getExpression(), q.getRoot());
+					if (original != null && original != n) throw new IllegalArgumentException(r.name + " has different bindings across stages");
+					original = n;
+				}
+			}
 			for (var q : r.qualifiers) {
 				q.getRoot().indexBuildSession(() -> {
 					Glsl.removeLayout(q, "location", "set", "binding");
@@ -173,7 +183,7 @@ public final class VulkanGlslTranslator {
 					Glsl.setLayout(q, "binding", b);
 				});
 			}
-			descriptors.add(new Descriptor(r.name, r.kind, r.type, r.count, SET, b, null, r.stages));
+			descriptors.add(new Descriptor(r.name, r.kind, r.type, r.count, SET, b, original, r.stages));
 		}
 
 		Map<String, Integer> attributes = assignLocations(trees);

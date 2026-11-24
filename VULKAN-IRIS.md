@@ -7,7 +7,7 @@ backend, borrowing the Vulkan device of the renderer that owns it (Polydium toda
 
 - `vulkan/` — the Vulkan core (`dev.vulkaniris.vk`), plain Java 21 + LWJGL, unit-tested on the real GPU (`gradlew :vulkan:test`).
 - `fabric/src/main/java/dev/vulkaniris/fabric` — Minecraft side: device borrowing, in-game self-tests.
-- In-game self-tests: `gradlew :fabric:prodFirstLight`, `gradlew :fabric:prodPhase4` (needs the jars listed in `run-deps/README.txt`).
+- In-game self-tests: `gradlew :fabric:prodFirstLight`, `gradlew :fabric:prodPhase4`, `gradlew :fabric:prodPhase5`, `gradlew :fabric:prodPhase6` (needs the jars listed in `run-deps/README.txt`).
 
 Gradle must run on JDK 25 (mods target Java 21). Based on Iris 1.10.8 for Minecraft 1.21.11.
 

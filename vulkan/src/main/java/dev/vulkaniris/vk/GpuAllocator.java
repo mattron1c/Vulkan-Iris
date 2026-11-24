@@ -94,6 +94,35 @@ public final class GpuAllocator implements AutoCloseable {
 		}
 	}
 
+	/** Sampled 3D texture (pack {@code TEXTURE_3D} custom textures). {@link GpuImage#height()} is the y size; depth is the caller's. */
+	public GpuImage createImage3D(String name, int format, int width, int height, int depth, int usage) {
+		if (width <= 0 || height <= 0 || depth <= 0) throw new IllegalArgumentException(name + ": bad size " + width + "x" + height + "x" + depth);
+		try (MemoryStack stack = stackPush()) {
+			VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default().imageType(VK_IMAGE_TYPE_3D).format(format)
+				.extent(e -> e.set(width, height, depth)).mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
+				.tiling(VK_IMAGE_TILING_OPTIMAL).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
+			VmaAllocationCreateInfo aci = VmaAllocationCreateInfo.calloc(stack).usage(VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+			LongBuffer pImage = stack.mallocLong(1);
+			PointerBuffer pAlloc = stack.mallocPointer(1);
+			VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
+			VkCheck.check(vmaCreateImage(vma, ici, aci, pImage, pAlloc, info), "vmaCreateImage(" + name + " " + width + "x" + height + "x" + depth + ")");
+			long image = pImage.get(0), alloc = pAlloc.get(0);
+			long view;
+			try {
+				VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_3D)
+					.format(format).subresourceRange(r -> r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+				VkCheck.check(vkCreateImageView(ctx.device(), vci, null, pImage), "vkCreateImageView(" + name + ")");
+				view = pImage.get(0);
+			} catch (RuntimeException e) {
+				vmaDestroyImage(vma, image, alloc);
+				throw e;
+			}
+			imageBytes.addAndGet(info.size());
+			liveImages.incrementAndGet();
+			return new GpuImage(name, image, view, alloc, info.size(), format, width, height, VK_IMAGE_ASPECT_COLOR_BIT, false);
+		}
+	}
+
 	/**
 	 * Buffer. {@code hostVisible}: persistently mapped and CPU-writable (staging, per-frame uniforms) — on ReBAR/UMA
 	 * VMA places it in device-local host-visible memory, so the GPU reads it without a copy.

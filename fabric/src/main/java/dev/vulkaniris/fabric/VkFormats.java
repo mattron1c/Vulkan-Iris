@@ -1,0 +1,77 @@
+package dev.vulkaniris.fabric;
+
+import net.irisshaders.iris.gl.texture.InternalTextureFormat;
+
+import static org.lwjgl.vulkan.VK10.*;
+
+/** Iris render-target formats ({@code colortexNFormat}) to the matching VkFormat. Every GL format Iris accepts has an exact one. */
+final class VkFormats {
+	private VkFormats() {
+	}
+
+	static int of(InternalTextureFormat f) {
+		return switch (f) {
+			case RGBA, RGBA8 -> VK_FORMAT_R8G8B8A8_UNORM;
+			case R8 -> VK_FORMAT_R8_UNORM;
+			case RG8 -> VK_FORMAT_R8G8_UNORM;
+			case RGB8 -> VK_FORMAT_R8G8B8_UNORM;
+			case R8_SNORM -> VK_FORMAT_R8_SNORM;
+			case RG8_SNORM -> VK_FORMAT_R8G8_SNORM;
+			case RGB8_SNORM -> VK_FORMAT_R8G8B8_SNORM;
+			case RGBA8_SNORM -> VK_FORMAT_R8G8B8A8_SNORM;
+			case R16 -> VK_FORMAT_R16_UNORM;
+			case RG16 -> VK_FORMAT_R16G16_UNORM;
+			case RGB16 -> VK_FORMAT_R16G16B16_UNORM;
+			case RGBA16 -> VK_FORMAT_R16G16B16A16_UNORM;
+			case R16_SNORM -> VK_FORMAT_R16_SNORM;
+			case RG16_SNORM -> VK_FORMAT_R16G16_SNORM;
+			case RGB16_SNORM -> VK_FORMAT_R16G16B16_SNORM;
+			case RGBA16_SNORM -> VK_FORMAT_R16G16B16A16_SNORM;
+			case R16F -> VK_FORMAT_R16_SFLOAT;
+			case RG16F -> VK_FORMAT_R16G16_SFLOAT;
+			case RGB16F -> VK_FORMAT_R16G16B16_SFLOAT;
+			case RGBA16F -> VK_FORMAT_R16G16B16A16_SFLOAT;
+			case R32F -> VK_FORMAT_R32_SFLOAT;
+			case RG32F -> VK_FORMAT_R32G32_SFLOAT;
+			case RGB32F -> VK_FORMAT_R32G32B32_SFLOAT;
+			case RGBA32F -> VK_FORMAT_R32G32B32A32_SFLOAT;
+			case R8I -> VK_FORMAT_R8_SINT;
+			case RG8I -> VK_FORMAT_R8G8_SINT;
+			case RGB8I -> VK_FORMAT_R8G8B8_SINT;
+			case RGBA8I -> VK_FORMAT_R8G8B8A8_SINT;
+			case R8UI -> VK_FORMAT_R8_UINT;
+			case RG8UI -> VK_FORMAT_R8G8_UINT;
+			case RGB8UI -> VK_FORMAT_R8G8B8_UINT;
+			case RGBA8UI -> VK_FORMAT_R8G8B8A8_UINT;
+			case R16I -> VK_FORMAT_R16_SINT;
+			case RG16I -> VK_FORMAT_R16G16_SINT;
+			case RGB16I -> VK_FORMAT_R16G16B16_SINT;
+			case RGBA16I -> VK_FORMAT_R16G16B16A16_SINT;
+			case R16UI -> VK_FORMAT_R16_UINT;
+			case RG16UI -> VK_FORMAT_R16G16_UINT;
+			case RGB16UI -> VK_FORMAT_R16G16B16_UINT;
+			case RGBA16UI -> VK_FORMAT_R16G16B16A16_UINT;
+			case R32I -> VK_FORMAT_R32_SINT;
+			case RG32I -> VK_FORMAT_R32G32_SINT;
+			case RGB32I -> VK_FORMAT_R32G32B32_SINT;
+			case RGBA32I -> VK_FORMAT_R32G32B32A32_SINT;
+			case R32UI -> VK_FORMAT_R32_UINT;
+			case RG32UI -> VK_FORMAT_R32G32_UINT;
+			case RGB32UI -> VK_FORMAT_R32G32B32_UINT;
+			case RGBA32UI -> VK_FORMAT_R32G32B32A32_UINT;
+			case RGBA2, RGBA4 -> VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+			case R3_G3_B2 -> VK_FORMAT_R8G8B8A8_UNORM; // no Vulkan 3-3-2 format; 8 bits per channel is a superset
+			case RGB5_A1 -> VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+			case RGB565 -> VK_FORMAT_R5G6B5_UNORM_PACK16;
+			case RGB10_A2 -> VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+			case RGB10_A2UI -> VK_FORMAT_A2B10G10R10_UINT_PACK32;
+			case R11F_G11F_B10F -> VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+			case RGB9_E5 -> VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+		};
+	}
+
+	static boolean isInteger(InternalTextureFormat f) {
+		String n = f.name();
+		return n.endsWith("I") || n.endsWith("UI");
+	}
+}

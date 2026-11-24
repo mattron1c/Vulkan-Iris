@@ -136,6 +136,11 @@ public final class RenderTargetSet implements AutoCloseable {
 		flipped[i] = !flipped[i];
 	}
 
+	/** True when {@link #read} is currently the alternate image. */
+	public boolean flipped(int i) {
+		return flipped[i];
+	}
+
 	public int format(int i) { return formats[i]; }
 	public int requestedFormat(int i) { return requestedFormats[i]; }
 	public int width() { return width; }

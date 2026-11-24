@@ -173,6 +173,8 @@ fun registerProdSelfTest(name: String, flag: String) =
         mods.from(SODIUM_DEPENDENCY_FABRIC)
         mods.from(fileTree(rootDir.resolve("run-deps/polydium")) { include("*.jar") })
         jvmArgs.addAll("-Dorg.lwjgl.system.stackSize=256", "-D$flag=true")
+        // e.g. gradlew :fabric:prodPhase6 -Dvulkaniris.phase6.packs=bsl,complementary
+        System.getProperty("vulkaniris.phase6.packs")?.let { jvmArgs.add("-Dvulkaniris.phase6.packs=$it") }
         runDir.set(project.layout.projectDirectory.dir("run-prod"))
     }
 
@@ -181,3 +183,5 @@ registerProdSelfTest("prodFirstLight", "vulkaniris.firstlight.selftest")
 registerProdSelfTest("prodPhase4", "vulkaniris.phase4.selftest")
 // gradlew :fabric:prodPhase5 — every pack in fabric/run-prod/shaderpacks: Iris patcher → Vulkan GLSL → SPIR-V → driver
 registerProdSelfTest("prodPhase5", "vulkaniris.phase5.selftest")
+// gradlew :fabric:prodPhase6 — each pack's begin/prepare/deferred/composite/final chain on Polydium's live frame, PNGs + report
+registerProdSelfTest("prodPhase6", "vulkaniris.phase6.selftest")

@@ -79,6 +79,21 @@ public final class ImageReadback implements AutoCloseable {
 		}
 	}
 
+	/** All copied texels (4 bytes each, row 0 = the image's row {@code y}). Only valid after the GPU finished. */
+	public byte[] bytes() {
+		try (MemoryStack stack = stackPush()) {
+			PointerBuffer map = stack.mallocPointer(1);
+			VkCheck.check(vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, map), "vkMapMemory(readback)");
+			try {
+				byte[] out = new byte[width * height * 4];
+				MemoryUtil.memByteBuffer(map.get(0), out.length).get(out);
+				return out;
+			} finally {
+				vkUnmapMemory(device, memory);
+			}
+		}
+	}
+
 	/** The 4 bytes at (px, py) as a little-endian float (R32F / D32_SFLOAT). */
 	public float float32(int px, int py) {
 		int[] p = pixel(px, py);
