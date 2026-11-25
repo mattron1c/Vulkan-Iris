@@ -24,6 +24,10 @@ val PARCHMENT_VERSION by extra { null }
 // https://semver.org/
 val MOD_VERSION by extra { "1.10.8" }
 
+// Vulkan Iris's own release number. The mod's version stays Iris's (mods that check "iris >= x" read it through
+// provides: iris); this goes into the build metadata (ignored when versions are compared) and the release file name.
+val VULKAN_IRIS_VERSION by extra { "1.0.0-beta.1" }
+
 allprojects {
     apply(plugin = "java")
     apply(plugin = "maven-publish")
@@ -57,6 +61,7 @@ subprojects {
         }
 
         builder.append("+mc").append(MINECRAFT_VERSION)
+        if (isReleaseBuild) builder.append("-vulkaniris.").append(VULKAN_IRIS_VERSION)
 
         if (!isReleaseBuild) {
             if (buildId != null) {

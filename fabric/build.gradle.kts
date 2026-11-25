@@ -160,6 +160,12 @@ tasks {
     }
 
     remapJar.get().destinationDirectory = rootDir.resolve("build").resolve("libs")
+    // gradlew :fabric:remapJar -Pbuild.release: the file players download
+    if (project.hasProperty("build.release")) {
+        val VULKAN_IRIS_VERSION: String by rootProject.extra
+        val MINECRAFT_VERSION: String by rootProject.extra
+        remapJar.get().archiveFileName.set("vulkan-iris-$VULKAN_IRIS_VERSION+mc$MINECRAFT_VERSION.jar")
+    }
 }
 
 // gradlew :fabric:prodFirstLight — launches a *production* Minecraft 1.21.11 (real mods folder, like a launcher)
