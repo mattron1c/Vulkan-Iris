@@ -29,8 +29,9 @@ No performance claim about Vulkan Iris is made without these numbers. Where Vulk
   - median, 99th percentile and worst frame time
 - **Diagnostics:** `-Dvulkaniris.bench.gclog=<file>` (GC log), `-Dvulkaniris.bench.jvm="<flags>"` (extra JVM flags, e.g. JFR or
   another GC). The report also says how many pipelines were built on first use while measuring (0 in the packs checked).
-- **Not measured yet:** GPU time per stage (timestamp queries on Vulkan, `GL_TIME_ELAPSED` on GL), and CPU time split
-  from GPU time. Without them, the numbers below don't say *where* the time goes.
+- **GPU time per stage, B only:** `-Dvulkaniris.gputime=true` (see [GPU time per stage](#gpu-time-per-stage-b-only)).
+- **Not measured yet:** GPU time per stage on GL (`GL_TIME_ELAPSED` around Iris's stages). Without it, the stage
+  times can't be set against A's.
 - Packs run one after another in one game session per side, in the same order. A and B never run at the same time.
 
 ## Results — 2026-11-24, NVIDIA RTX 5060 (driver 610.88), after the frame-spike fix
@@ -73,8 +74,53 @@ code on the GL side); B was re-run after the fix described in [Frame-time spikes
   Each pack's Phase 7 notes list these. They mostly make B's frame *cheaper* than A's, so they don't explain B's losses.
 - **Limits of this run:**
   - one run per side, one GPU, one resolution
-  - no GPU per-stage times yet
+  - one run per side, one GPU, one resolution
   - wall-clock frame times include the present and the CPU
+
+## GPU time per stage (B only)
+`gradlew :fabric:prodBenchVulkan -Dvulkaniris.gputime=true` writes a timestamp (`vkCmdWriteTimestamp`, bottom of pipe)
+at each boundary of Vulkan Iris's frame. Results are read back 8 frames later without waiting. The report gives the
+average GPU time between consecutive marks over the measured 60 s; in this run every frame was timed (none skipped).
+
+What each interval holds:
+- **begin:** uploads, uniforms, clears, `setup`, the `begin` stage
+- **shadow pass:** `shadow.csh`, shadow clears, shadow terrain and entities, `shadowcomp`
+- **opaque world:** from the end of `prepare` to `deferred`. This is Polydium and Sodium drawing the opaque world
+  (terrain, entities, block entities, sky, particles) with the pack's gbuffers programs, plus Polydium's own work in
+  between.
+- **deferred:** the depth copy, centre depth and the `deferred` stage
+- **translucent + hand:** translucent terrain, translucent entities, clouds, weather and the hand, with the pack's programs
+- **composite + final:** the `composite` stage, `final` and the copy-back
+
+The `prepare` stage and the gaps between hooks were under 0.02 ms in every pack except Solas (0.06 ms before the
+shadow pass); they are left out below. Times in ms per frame. RTX 5060, 854×480, 2026-11-25.
+
+| pack | B FPS | B median frame | GPU frame | begin | shadow pass | opaque world | deferred | translucent + hand | composite + final |
+|---|---|---|---|---|---|---|---|---|---|
+| Bliss | 460 | 2.04 ms | 2.12 ms | 0.01 | 0.50 | 0.67 | 0.23 | 0.12 | 0.58 |
+| BSL | 363 | 2.59 ms | 2.70 ms | 0.01 | 0.80 | 0.91 | 0.10 | 0.67 | 0.19 |
+| Complementary Reimagined | 351 | 2.68 ms | 2.80 ms | 0.02 | 0.77 | 1.28 | 0.11 | 0.30 | 0.31 |
+| Complementary Unbound | 328 | 2.89 ms | 3.00 ms | 0.02 | 0.85 | 1.28 | 0.10 | 0.43 | 0.31 |
+| MakeUp UltraFast | 771 | 1.22 ms | 1.23 ms | 0.00 | 0.27 | 0.59 | 0.06 | 0.14 | 0.16 |
+| Mellow | 995 | 0.95 ms | 0.81 ms | 0.00 | 0.18 | 0.45 | 0.02 | 0.09 | 0.06 |
+| miniature | 999 | 0.92 ms | 0.82 ms | 0.01 | 0.19 | 0.50 | 0.01 | 0.11 | 0.01 |
+| Noble | 164 | 6.04 ms | 6.03 ms | 0.03 | 1.46 | 0.79 | 2.65 | 0.23 | 0.84 |
+| Sildur's Vibrant Extreme | 405 | 2.32 ms | 2.41 ms | 0.02 | 1.11 | 0.61 | 0.24 | 0.27 | 0.16 |
+| Solas | 304 | 3.12 ms | 3.23 ms | 0.07 | 0.82 | 1.51 | 0.20 | 0.32 | 0.25 |
+
+- **B is GPU-bound in every pack.**
+  - In the heavier packs, the GPU frame is about the wall-clock median frame (within 0.1 ms).
+  - In the light packs (Mellow, miniature) the GPU frame is 0.1 ms shorter, so the CPU and the present are a small
+    share of the frame.
+  - So B's losses against A are GPU time, not CPU overhead.
+- **Where it goes.** The shadow pass and the opaque world together are 55–84 % of the GPU frame in every pack but
+  Noble (37 %).
+  - Noble's deferred stage takes 2.65 ms, 44 % of its frame.
+  - BSL's translucent pass takes 0.67 ms, more than its deferred and composite stages together.
+- **Not known yet: whether any stage is slower than Iris's on GL.** That needs the same split on A.
+- **This run was slower than the untimed one** by 3–14 % average FPS (Noble 191 → 164; it also had one 144 ms frame).
+  - It isn't known whether that is the timestamps' cost or run-to-run variance.
+  - So the timing is opt-in, and the FPS table above comes from runs without it.
 
 ## Frame-time spikes: found and fixed
 The first run (below) had a 20–68 ms frame every 2–3 s on B, in every pack, and none in the no-pack control.

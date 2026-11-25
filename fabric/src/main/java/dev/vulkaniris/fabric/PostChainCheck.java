@@ -138,8 +138,10 @@ public final class PostChainCheck {
 				line((packIndex < 0 ? "bench (no pack: vanilla on Polydium Vulkan): " : "bench: ") + bench.result());
 				if (chain != null) line("  pipelines built on first use while measuring: " + (chain.variantsBuilt() - benchVariants)
 					+ " (slowest pipeline build of the pack: " + String.format("%.1f", chain.variantMaxNanos() / 1e6) + " ms)");
+				if (chain != null) line("  GPU stages: " + (chain.gpuTimer() == null ? "no timestamps on this queue" : chain.gpuTimer().report()));
 			} else if (!wasMeasuring && bench.measuring() && chain != null) {
 				benchVariants = chain.variantsBuilt();
+				if (chain.gpuTimer() != null) chain.gpuTimer().reset();
 			}
 		}
 		try {

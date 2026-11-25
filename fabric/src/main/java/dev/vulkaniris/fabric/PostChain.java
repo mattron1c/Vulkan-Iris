@@ -2190,6 +2190,18 @@ final class PostChain implements AutoCloseable {
 	private VkCommandBuffer cmd;
 	private LayoutTracker tracker;
 	private long stagingSubmit = -1;
+	/** GPU time per stage (bench mode or -Dvulkaniris.gputime); null when off or unsupported. */
+	private GpuTimer gpuTimer;
+	private boolean gpuTimerTried;
+
+	/** The GPU stage timer, or null (off, or no timestamps on the graphics queue). */
+	GpuTimer gpuTimer() {
+		return gpuTimer;
+	}
+
+	private void gpuMark(String name) {
+		if (gpuTimer != null) gpuTimer.mark(cmd, name);
+	}
 
 	/**
 	 * Records the whole chain. {@code mainColor} holds the vanilla frame on entry and the pack's final output on exit.
@@ -2249,6 +2261,11 @@ final class PostChain implements AutoCloseable {
 		translucentDone = false;
 		handCopied = false;
 		segment(cmd, tracker);
+		if (GpuTimer.ENABLED && !gpuTimerTried) {
+			gpuTimerTried = true;
+			gpuTimer = GpuTimer.create(ctx, clock);
+		}
+		if (gpuTimer != null) gpuTimer.frameStart(cmd);
 		targets.resize(mainColor.width(), mainColor.height());
 		if (withGbuffers) ensureDepthCopy();
 		if (!uploads.isEmpty()) {
@@ -2279,6 +2296,7 @@ final class PostChain implements AutoCloseable {
 		for (var e : passes.entrySet()) {
 			if (e.getKey().stage() == TextureStage.BEGIN) runStage(e.getKey(), e.getValue());
 		}
+		gpuMark("begin end");
 		endSegment();
 	}
 
@@ -2297,6 +2315,7 @@ final class PostChain implements AutoCloseable {
 		if (!levelBegun || translucentDone) throw new IllegalStateException("beforeTranslucent out of order");
 		segment(cmd, tracker);
 		ensurePrepared();
+		gpuMark("deferred start");
 		translucentDone = true;
 		if (!hasTerrain()) copyScene(mainColor);
 		if (depthNoTranslucent != null) copyDepth(mainDepth, depthNoTranslucent);
@@ -2304,6 +2323,7 @@ final class PostChain implements AutoCloseable {
 		for (var e : passes.entrySet()) {
 			if (e.getKey().stage() == TextureStage.DEFERRED) runStage(e.getKey(), e.getValue());
 		}
+		gpuMark("deferred end");
 		endSegment();
 	}
 
@@ -2323,6 +2343,7 @@ final class PostChain implements AutoCloseable {
 		if (!translucentDone) beforeTranslucent(cmd, tracker);
 		segment(cmd, tracker);
 		ensurePrepared();
+		gpuMark("composite start");
 		for (var e : passes.entrySet()) {
 			if (e.getKey().stage() == TextureStage.COMPOSITE_AND_FINAL) runStage(e.getKey(), e.getValue());
 		}
@@ -2332,6 +2353,8 @@ final class PostChain implements AutoCloseable {
 			blitToScreen(targets.read(0), mainColor);
 		}
 		copyBack();
+		gpuMark("final end");
+		if (gpuTimer != null) gpuTimer.frameEnd();
 		frame++;
 		levelBegun = false;
 		endSegment();
@@ -2653,6 +2676,7 @@ final class PostChain implements AutoCloseable {
 		if (!levelBegun) throw new IllegalStateException("shadow pass before beginLevel");
 		if (!hasShadowPass()) throw new IllegalStateException("beginShadow without a shadow pass");
 		segment(cmd, tracker);
+		gpuMark("shadow start");
 		shadowModelView.set(modelView);
 		shadowProjection.set(projection);
 		clearDepth(shadowDepthImage(0), 1f);
@@ -2715,6 +2739,7 @@ final class PostChain implements AutoCloseable {
 		if (!shadowTranslucentCopied) copyDepth(shadowDepth, shadowDepthNoTranslucent);
 		shadowTranslucentCopied = true;
 		for (Pass p : shadowComposite) runShadowComposite(p);
+		gpuMark("shadow end");
 		shadowBegun = false;
 		shadowFrames++;
 		endSegment();
@@ -2737,9 +2762,11 @@ final class PostChain implements AutoCloseable {
 	private void ensurePrepared() {
 		if (prepareDone) return;
 		prepareDone = true;
+		gpuMark("prepare start");
 		for (var e : passes.entrySet()) {
 			if (e.getKey().stage() == TextureStage.PREPARE) runStage(e.getKey(), e.getValue());
 		}
+		gpuMark("prepare end");
 	}
 
 	private boolean slotFree(Pass p) {
@@ -3120,5 +3147,6 @@ final class PostChain implements AutoCloseable {
 		ownedImages.forEach(alloc::destroy);
 		ownedBuffers.forEach(alloc::destroy);
 		staging.forEach(alloc::destroy);
+		if (gpuTimer != null) gpuTimer.close();
 	}
 }

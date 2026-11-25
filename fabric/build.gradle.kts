@@ -181,6 +181,7 @@ fun registerProdSelfTest(name: String, flag: String) =
         // benchmark length: gradlew :fabric:prodBenchVulkan -Dvulkaniris.bench.seconds=60 -Dvulkaniris.bench.warmup=20
         System.getProperty("vulkaniris.bench.seconds")?.let { jvmArgs.add("-Dvulkaniris.bench.seconds=$it") }
         System.getProperty("vulkaniris.bench.warmup")?.let { jvmArgs.add("-Dvulkaniris.bench.warmup=$it") }
+        System.getProperty("vulkaniris.gputime")?.let { jvmArgs.add("-Dvulkaniris.gputime=$it") }
         // GC log for frame-time spikes: -Dvulkaniris.bench.gclog=gc.log (in run-prod)
         System.getProperty("vulkaniris.bench.gclog")?.let { jvmArgs.add("-Xlog:gc:file=$it") }
         // extra JVM flags for a bench run, e.g. -Dvulkaniris.bench.jvm="-XX:+UseZGC -XX:+ZGenerational"
