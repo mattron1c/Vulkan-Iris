@@ -12,6 +12,15 @@ public class SamplerLimits {
 	private final int maxShaderStorageUnits;
 
 	private SamplerLimits() {
+		if (net.irisshaders.iris.gl.shader.StandardMacros.isVulkanBackend()) {
+			// Vulkan Iris: GL limits don't exist on Vulkan (no GL context; Polydium stubs GL calls). Nothing on the Vulkan
+			// path should need them, so whoever got here is logged to be fixed.
+			net.irisshaders.iris.Iris.logger.warn("[Vulkan Iris] GL sampler limits requested on the Vulkan backend", new Throwable("caller"));
+			this.maxTextureUnits = 0;
+			this.maxDrawBuffers = 0;
+			this.maxShaderStorageUnits = 0;
+			return;
+		}
 		this.maxTextureUnits = GlStateManager._getInteger(GL20C.GL_MAX_TEXTURE_IMAGE_UNITS);
 		this.maxDrawBuffers = GlStateManager._getInteger(GL20C.GL_MAX_DRAW_BUFFERS);
 		this.maxShaderStorageUnits = IrisRenderSystem.supportsSSBO() ? GlStateManager._getInteger(GL45C.GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS) : 0;

@@ -204,7 +204,7 @@ public class Iris {
 				setShadersDisabled();
 				fallback = true;
 			}
-		} else if (shaderpackScreenKeybind.consumeClick()) {
+		} else if (shaderpackScreenKeybind != null && shaderpackScreenKeybind.consumeClick()) {
 			minecraft.setScreen(new ShaderPackScreen(null));
 		} else if (wireframeKeybind.consumeClick()) {
 			if (irisConfig.areDebugOptionsEnabled() && minecraft.player != null && !Minecraft.getInstance().isLocalServer()) {
@@ -563,6 +563,10 @@ public class Iris {
 	}
 
 	public static void reload() throws IOException {
+		if (net.irisshaders.iris.gl.shader.StandardMacros.isVulkanBackend()) {
+			reloadForVulkan();
+			return;
+		}
 		// allows shaderpacks to be changed at runtime
 		irisConfig.initialize();
 
@@ -588,7 +592,7 @@ public class Iris {
 	private static void destroyEverything() {
 		currentPack = null;
 
-		getPipelineManager().destroyPipeline();
+		if (pipelineManager != null) getPipelineManager().destroyPipeline();
 
 		// Close the zip filesystem that the shaderpack was loaded from
 		//
@@ -697,11 +701,49 @@ public class Iris {
 	 * {@link #onEarlyInitialize()} never runs. This sets up the state shader-pack loading needs (version, config)
 	 * without keybinds or GL. No-op if Iris already initialised normally.
 	 */
+	/**
+	 * Vulkan Iris: bumped whenever the shader pack (or its options) was reloaded on the Vulkan backend; Vulkan Iris
+	 * rebuilds its pipeline when it changes.
+	 */
+	public static volatile int vulkanPackGeneration;
+
+	/**
+	 * Vulkan Iris: Iris's {@link #reload()} on the Vulkan backend. It reloads the config and the shader pack (with its
+	 * options), as on GL, but there is no GL pipeline: Vulkan Iris builds its own from {@link #getCurrentPack()} when
+	 * {@link #vulkanPackGeneration} changes.
+	 */
+	private static void reloadForVulkan() throws IOException {
+		irisConfig.initialize();
+		CapturedRenderingState.INSTANCE.resetTextureReloadCount();
+		destroyEverything();
+		loadShaderpack();
+		vulkanPackGeneration++;
+	}
+
+	/**
+	 * Vulkan Iris: Iris's key bindings (reload R, toggle K, shader pack screen O, wireframe) when its own early init
+	 * never ran because Polydium stripped Iris's mixins. Must run before the game options load (client init).
+	 */
+	public static synchronized void registerKeybindsForVulkan() {
+		if (reloadKeybind != null) return;
+		reloadKeybind = IrisPlatformHelpers.getInstance().registerKeyBinding(new KeyMapping("iris.keybind.reload", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_R, irisKeybindCategory));
+		toggleShadersKeybind = IrisPlatformHelpers.getInstance().registerKeyBinding(new KeyMapping("iris.keybind.toggleShaders", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_K, irisKeybindCategory));
+		// Polydium registers iris.keybind.shaderPackSelection (O) itself on Vulkan; Vulkan Iris makes it open this screen
+		wireframeKeybind = IrisPlatformHelpers.getInstance().registerKeyBinding(new KeyMapping("iris.keybind.wireframe", InputConstants.Type.KEYSYM, InputConstants.UNKNOWN.getValue(), irisKeybindCategory));
+	}
+
+	/** Vulkan Iris: whether {@link #registerKeybindsForVulkan()} (or Iris's own init) registered the key bindings. */
+	public static boolean keybindsRegistered() {
+		return reloadKeybind != null;
+	}
+
 	public static synchronized void initializeForVulkan() {
 		if (IRIS_VERSION == null) {
 			IRIS_VERSION = IrisPlatformHelpers.getInstance().getVersion();
 			DHCompat.run(); // decides whether Distant Horizons is present; uniforms (dhRenderDistance…) depend on it
 		}
+		// the shader pack screen reads it; never checked here (it would report upstream Iris releases, not this fork's)
+		if (updateChecker == null) updateChecker = new UpdateChecker(IRIS_VERSION);
 		if (irisConfig == null) {
 			irisConfig = new IrisConfig(IrisPlatformHelpers.getInstance().getConfigDir().resolve("iris.properties"),
 				IrisPlatformHelpers.getInstance().getConfigDir().resolve("iris-excluded.json"));

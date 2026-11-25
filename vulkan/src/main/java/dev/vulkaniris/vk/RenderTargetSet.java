@@ -30,6 +30,8 @@ public final class RenderTargetSet implements AutoCloseable {
 	private int width, height;
 	private int generation;
 	private final Sizer sizer;
+	/** Targets a pass samples with mipmaps (Iris {@code mipmap.<program>.colortexN}): created with a full mip chain. */
+	private final boolean[] mipmapped;
 
 	/** The size of colortex{index} for a {@code width} x {@code height} screen (Iris: size.buffer.colortexN). */
 	@FunctionalInterface
@@ -44,7 +46,13 @@ public final class RenderTargetSet implements AutoCloseable {
 
 	/** As above; each target is {@code sizer}'s size for the screen size, which {@link #width()} / {@link #height()} keep. */
 	public RenderTargetSet(GpuAllocator allocator, DeferredDestroyer destroyer, int[] formats, int width, int height, Sizer sizer) {
+		this(allocator, destroyer, formats, width, height, sizer, new boolean[formats.length]);
+	}
+
+	/** As above; {@code mipmapped[i]}: colortex{i} gets a mip chain if its format can be blit with linear filtering. */
+	public RenderTargetSet(GpuAllocator allocator, DeferredDestroyer destroyer, int[] formats, int width, int height, Sizer sizer, boolean[] mipmapped) {
 		this.sizer = sizer;
+		this.mipmapped = new boolean[formats.length];
 		if (formats.length > MAX_TARGETS) throw new IllegalArgumentException("at most " + MAX_TARGETS + " colortex targets");
 		this.allocator = allocator;
 		this.destroyer = destroyer;
@@ -58,6 +66,10 @@ public final class RenderTargetSet implements AutoCloseable {
 			this.formats[i] = renderableFormat(allocator.context(), formats[i]);
 			if (this.formats[i] != formats[i]) {
 				allocator.context().log().info("colortex" + i + ": format " + formats[i] + " is not renderable on this GPU, using " + this.formats[i]);
+			}
+			if (i < mipmapped.length && mipmapped[i]) {
+				this.mipmapped[i] = MipChain.canGenerate(allocator.context(), this.formats[i]);
+				if (!this.mipmapped[i]) allocator.context().log().info("colortex" + i + ": format " + this.formats[i] + " can't be blit with linear filtering; no mipmaps");
 			}
 		}
 		allocate(width, height);
@@ -103,8 +115,9 @@ public final class RenderTargetSet implements AutoCloseable {
 			if ((optimalTilingFeatures(allocator.context(), fmt) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 			int[] size = sizer.size(i, w, h);
 			int tw = Math.max(1, size[0]), th = Math.max(1, size[1]);
-			main[i] = allocator.createImage("colortex" + i, fmt, tw, th, usage, VK_IMAGE_ASPECT_COLOR_BIT);
-			alt[i] = allocator.createImage("colortex" + i + "alt", fmt, tw, th, usage, VK_IMAGE_ASPECT_COLOR_BIT);
+			int levels = mipmapped[i] ? GpuAllocator.fullMipChain(tw, th) : 1;
+			main[i] = allocator.createImage("colortex" + i, fmt, tw, th, usage, VK_IMAGE_ASPECT_COLOR_BIT, levels);
+			alt[i] = allocator.createImage("colortex" + i + "alt", fmt, tw, th, usage, VK_IMAGE_ASPECT_COLOR_BIT, levels);
 		}
 		width = w;
 		height = h;

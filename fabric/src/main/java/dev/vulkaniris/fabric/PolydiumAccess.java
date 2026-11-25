@@ -27,7 +27,7 @@ import static org.lwjgl.vulkan.VK10.VK_IMAGE_LAYOUT_GENERAL;
  * ALL_COMMANDS memory barrier ({@code VulkanCommandEncoder.memoryBarrier}); {@code commandBuffer()} is the frame
  * command buffer being recorded and {@code currentSubmitIndex()} identifies its submission.</p>
  */
-final class PolydiumAccess {
+public final class PolydiumAccess {
 	/** Image layout Polydium keeps every texture in. */
 	static final int TEXTURE_LAYOUT = VK_IMAGE_LAYOUT_GENERAL;
 
@@ -38,7 +38,16 @@ final class PolydiumAccess {
 		return VulkanActive.active && VulkanDevice.active != null;
 	}
 
+	/**
+	 * Set by MixinPolydiumDeviceFeatures while Polydium creates its device: whether {@code independentBlend} was
+	 * added to the device's features. Null if that mixin did not run (then it is not assumed).
+	 */
+	public static volatile Boolean independentBlendEnabled;
+
 	static VulkanContext borrow(VkLog log) {
+		dev.vulkaniris.vk.GraphicsProgram.independentBlend = Boolean.TRUE.equals(independentBlendEnabled);
+		log.info("independentBlend on Polydium's device: " + (independentBlendEnabled == null ? "not requested (feature mixin did not run)"
+			: independentBlendEnabled ? "enabled" : "not supported by the GPU (per-buffer blend modes share one state)"));
 		VulkanDevice d = VulkanDevice.active;
 		int instanceApi = d.instance().vkInstance().getCapabilities().apiVersion;
 		Set<String> exts = d.getDeviceInfo().underlyingExtensions();

@@ -29,6 +29,7 @@ public class MixinGameRendererFirstLight {
 		ResourceCheck.afterGameRender();
 		PackCompileCheck.afterGameRender();
 		PostChainCheck.afterGameRender();
+		dev.vulkaniris.fabric.LiveTest.afterGameRender();
 		dev.vulkaniris.fabric.GlBench.afterGameRender();
 	}
 }

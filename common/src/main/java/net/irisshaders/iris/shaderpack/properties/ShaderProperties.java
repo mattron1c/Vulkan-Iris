@@ -314,7 +314,9 @@ public class ShaderProperties {
 			handlePassDirective("blend.", key, value, pass -> {
 				if (pass.contains(".")) {
 
-					if (!IrisRenderSystem.supportsBufferBlending()) {
+					// Vulkan Iris: on Vulkan, per-buffer blending is a device feature (see GraphicsProgram.independentBlend);
+					// IrisRenderSystem is GL-only and is not touched there
+					if (!net.irisshaders.iris.gl.shader.StandardMacros.isVulkanBackend() && !IrisRenderSystem.supportsBufferBlending()) {
 						throw new RuntimeException("Buffer blending is not supported on this platform, however it was attempted to be used!");
 					}
 

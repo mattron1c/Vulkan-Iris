@@ -21,7 +21,12 @@ import java.util.function.IntFunction;
 
 public class IrisApiV0Impl implements IrisApi {
 	public static final IrisApiV0Impl INSTANCE = new IrisApiV0Impl();
-	private static final IrisApiV0ConfigImpl CONFIG = new IrisApiV0ConfigImpl();
+	/**
+	 * Vulkan Iris: the config other mods get. Not {@link IrisApiV0ConfigImpl}: Polydium, on Vulkan, wraps that class so
+	 * it always reports shaders off and ignores changes (true for stock Iris there, not for Vulkan Iris). This class
+	 * does what IrisApiV0ConfigImpl does on Iris, on both backends.
+	 */
+	private static final IrisApiConfig CONFIG = new VulkanIrisApiConfig();
 
 	@Override
 	public int getMinorApiRevision() {
@@ -33,10 +38,13 @@ public class IrisApiV0Impl implements IrisApi {
 	 * occlusion culler, for one) ask this API whether a pack is in use, and must get the same answer they get on GL.
 	 */
 	public static volatile boolean vulkanPackInUse;
+	/** Vulkan Iris: the drawn pack's sunPathRotation (Iris's pipeline reports it on GL). */
+	public static volatile float vulkanSunPathRotation;
 
 	@Override
 	public boolean isShaderPackInUse() {
 		if (vulkanPackInUse) return true;
+		if (Iris.getPipelineManager() == null) return false; // Vulkan backend: no GL pipeline manager
 		WorldRenderingPipeline pipeline = Iris.getPipelineManager().getPipelineNullable();
 
 		if (pipeline == null) {
@@ -73,6 +81,8 @@ public class IrisApiV0Impl implements IrisApi {
 
 	@Override
 	public float getSunPathRotation() {
+		if (vulkanPackInUse) return vulkanSunPathRotation;
+		if (Iris.getPipelineManager() == null) return 0;
 		WorldRenderingPipeline pipeline = Iris.getPipelineManager().getPipelineNullable();
 
 		if (pipeline == null) {

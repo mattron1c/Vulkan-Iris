@@ -52,10 +52,15 @@ public final class ImageReadback implements AutoCloseable {
 
 	/** Same, for one aspect. Only formats with 4 bytes per texel in that aspect (RGBA8, R32F, D32_SFLOAT depth). */
 	public void record(VkCommandBuffer cmd, long image, int imageLayout, int x, int y, int aspect) {
+		record(cmd, image, imageLayout, x, y, aspect, 0);
+	}
+
+	/** Same, from mip level {@code mipLevel} (this readback's size must fit that level). */
+	public void record(VkCommandBuffer cmd, long image, int imageLayout, int x, int y, int aspect, int mipLevel) {
 		try (MemoryStack stack = stackPush()) {
 			VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
 			region.get(0).bufferOffset(0)
-				.imageSubresource(s -> s.aspectMask(aspect).mipLevel(0).baseArrayLayer(0).layerCount(1))
+				.imageSubresource(s -> s.aspectMask(aspect).mipLevel(mipLevel).baseArrayLayer(0).layerCount(1))
 				.imageOffset(o -> o.set(x, y, 0)).imageExtent(e -> e.set(width, height, 1));
 			vkCmdCopyImageToBuffer(cmd, image, imageLayout, buffer, region);
 			VkMemoryBarrier.Buffer b = VkMemoryBarrier.calloc(1, stack);

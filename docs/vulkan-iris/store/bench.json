@@ -1,0 +1,94 @@
+{
+  "setup": "RTX 5060, 854×480, render distance 16, same world, camera and pack defaults; 60 s measured after 20 s warm-up",
+  "note": "Higher is better. One run per side; see BENCHMARK.md.",
+  "gallery": [
+    {
+      "file": "BSL_v10.1.3",
+      "label": "BSL"
+    },
+    {
+      "file": "ComplementaryUnbound_r5.9.3",
+      "label": "Complementary Unbound"
+    },
+    {
+      "file": "Bliss_v2.1.2__Chocapic13_Shaders_edit_",
+      "label": "Bliss"
+    },
+    {
+      "file": "Sildur_s_Vibrant_Shaders_v2.02_Extreme",
+      "label": "Sildur's Vibrant Extreme"
+    },
+    {
+      "file": "Noble_v1.9.9",
+      "label": "Noble"
+    },
+    {
+      "file": "Solas_Shader_V3.7b",
+      "label": "Solas"
+    },
+    {
+      "file": "MakeUp-UltraFast-9.4b",
+      "label": "MakeUp UltraFast"
+    },
+    {
+      "file": "Mellow_v3.5",
+      "label": "Mellow"
+    }
+  ],
+  "packs": [
+    {
+      "name": "Bliss",
+      "gl": 434,
+      "vk": 509
+    },
+    {
+      "name": "BSL",
+      "gl": 423,
+      "vk": 402
+    },
+    {
+      "name": "Complementary Reimagined",
+      "gl": 354,
+      "vk": 372
+    },
+    {
+      "name": "Complementary Unbound",
+      "gl": 395,
+      "vk": 345
+    },
+    {
+      "name": "MakeUp UltraFast",
+      "gl": 596,
+      "vk": 897
+    },
+    {
+      "name": "Mellow",
+      "gl": 690,
+      "vk": 1451
+    },
+    {
+      "name": "miniature",
+      "gl": 541,
+      "vk": 1175
+    },
+    {
+      "name": "Noble",
+      "gl": 274,
+      "vk": 327
+    },
+    {
+      "name": "Sildur's Vibrant Extreme",
+      "gl": 385,
+      "vk": 495
+    },
+    {
+      "name": "Solas",
+      "gl": 316,
+      "vk": 302
+    }
+  ],
+  "control": {
+    "gl": 1094,
+    "vk": 2966
+  }
+}

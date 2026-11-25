@@ -52,6 +52,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -124,6 +125,10 @@ public final class PostChainCheck {
 
 	/** GameRenderer.render TAIL: world setup and timeouts. */
 	public static void afterGameRender() {
+		if (!ENABLED) {
+			liveFrame();
+			return;
+		}
 		if (ENABLED && done && !tornDown && finishSubmit >= 0 && PolydiumAccess.submitCompleted(finishSubmit)) teardown();
 		if (!ENABLED || done) return;
 		frames++;
@@ -183,6 +188,10 @@ public final class PostChainCheck {
 
 	/** LevelRenderer.renderLevel RETURN: the vanilla frame is in the main target. */
 	public static void afterLevel() {
+		if (live) {
+			liveTick();
+			return;
+		}
 		if (!ENABLED || done || worldFrames < SETTLE_FRAMES) return;
 		try {
 			tick();
@@ -358,7 +367,7 @@ public final class PostChainCheck {
 			}
 			if (root == null || !Files.exists(root)) throw new IllegalStateException("no shaders/ directory");
 			ImmutableList<StringPair> env = StandardMacros.createStandardEnvironmentDefines();
-			ProgramSet set = new ShaderPack(root, new HashMap<>(), env, zip != null).getProgramSet(DimensionId.OVERWORLD);
+			ProgramSet set = new ShaderPack(root, testPackOptions(), env, zip != null).getProgramSet(DimensionId.OVERWORLD);
 			RenderTarget main = Minecraft.getInstance().getMainRenderTarget();
 			chain = new PostChain(ctx, alloc, destroyer, clock, ring, samplers, compiler, set,
 				PolydiumAccess.vkFormat(main.getColorTexture()), PolydiumAccess.vkFormat(main.getDepthTexture()), main.width, main.height, GBUFFERS);
@@ -424,6 +433,17 @@ public final class PostChainCheck {
 		allPassed &= pass;
 		if (chain.hasTerrain()) line("terrain: " + terrainPasses + " terrain passes drawn with the pack's programs over " + (rebuildFrames + packFrames)
 			+ " frames; " + chain.staleRegions() + " region draws skipped while chunks were still in the old vertex format");
+		if (chain.hasTerrain()) {
+			String[] kinds = {"solid", "cutout", "translucent"};
+			StringBuilder b = new StringBuilder("terrain volume per terrain pass:");
+			for (int k = 0; k < 3; k++) {
+				long[] ts = chain.terrainStats[k];
+				long n = Math.max(1, terrainPasses / 3);
+				b.append(' ').append(kinds[k]).append(' ').append(ts[0] / n).append(" regions, ").append(ts[1] / n).append(" draws, ")
+					.append(ts[2] / n).append(" indices;");
+			}
+			line(b.toString());
+		}
 		if (chain.hasTerrain()) {
 			line("vanilla: " + (VanillaHook.redirectedPasses() - vanillaPassesAtStart) + " Polydium world passes redirected; draws per pack program "
 				+ chain.vanillaDraws());
@@ -523,6 +543,7 @@ public final class PostChainCheck {
 		probeBefore = probeAfter = null;
 		shadowFailed = false;
 		shadowCulling = "";
+		IrisApiV0Impl.vulkanSunPathRotation = chain.directives().getSunPathRotation();
 		IrisApiV0Impl.vulkanPackInUse = true;
 		Minecraft.getInstance().levelRenderer.allChanged();
 		line("terrain programs active; chunks rebuilding in the pack's vertex format (stride "
@@ -625,7 +646,7 @@ public final class PostChainCheck {
 	 * sky programs to have their targets (on GL Iris begins its pipeline at the same point).
 	 */
 	public static void beforeLevel() {
-		if (!ENABLED || done || ctx == null || chain == null || !chain.hasTerrain() || chain.levelBegun() || readbackSubmit >= 0
+		if (!(ENABLED || live) || done || ctx == null || chain == null || !chain.hasTerrain() || chain.levelBegun() || readbackSubmit >= 0
 			|| PolydiumAccess.inRenderPass()) return;
 		try {
 			RenderTarget main = Minecraft.getInstance().getMainRenderTarget();
@@ -722,7 +743,7 @@ public final class PostChainCheck {
 				shadowActive = true;
 				try {
 					finishProbe();
-					boolean probing = !Bench.ENABLED && shadowPasses == PROBE_PASS && probeBefore == null;
+					boolean probing = !Bench.ENABLED && !live && shadowPasses == PROBE_PASS && probeBefore == null;
 					VulkanShadow.beforeEntities = probing ? () -> probe(false) : null;
 					VulkanShadow.afterEntities = probing ? () -> probe(true) : null;
 					VulkanShadow.draw(chain.directives(), view, camera, cameraState, true);
@@ -797,6 +818,10 @@ public final class PostChainCheck {
 	}
 
 	private static void fail(String why) {
+		if (live) {
+			liveFault = why;
+			return;
+		}
 		allPassed = false;
 		line("FAIL: " + why);
 		finish();
@@ -849,7 +874,218 @@ public final class PostChainCheck {
 	}
 
 	private static void line(String s) {
-		report.append(s).append('\n');
+		if (!live) report.append(s).append('\n');
 		LOG.info(s);
 	}
+
+	/** {@code -Dvulkaniris.packOptions=NAME=value,NAME=value}: pack options for the test runs (default: the pack's defaults). */
+	private static Map<String, String> testPackOptions() {
+		Map<String, String> m = new HashMap<>();
+		String opts = System.getProperty("vulkaniris.packOptions", "");
+		for (String kv : opts.split(",")) {
+			int eq = kv.indexOf('=');
+			if (eq > 0) m.put(kv.substring(0, eq).trim(), kv.substring(eq + 1).trim());
+		}
+		return m;
+	}
+
+	// ------------------------------------------------------------------ live mode: the player's game
+
+	/**
+	 * Live mode: a normal game (no test property) with Polydium on Vulkan, which removed Iris's mixins. Vulkan Iris
+	 * draws the shader pack selected in Iris (iris.properties, its options from {@code shaderpacks/<pack>.txt}) with the
+	 * same frame hooks the tests use. It rebuilds on Iris's reload (R, the shader pack screen, K to toggle), on a
+	 * dimension change and on a window resize, and drops back to Polydium's vanilla rendering (with a chat message) if a
+	 * pack fails; that pack is not retried until Iris reloads.
+	 */
+	private static boolean live;
+	private static int liveGeneration = Integer.MIN_VALUE;
+	private static net.irisshaders.iris.shaderpack.materialmap.NamespacedId liveDimension;
+	private static boolean liveLoadTried;
+	private static int liveFailedGeneration = Integer.MIN_VALUE;
+	private static String liveFault;
+
+	/** True while Vulkan Iris draws a shader pack in the player's game. */
+	public static boolean liveActive() {
+		return live && chain != null;
+	}
+
+	/** GameRenderer.render TAIL, live mode: Iris's key bindings, entering live mode, leaving the world. */
+	private static void liveFrame() {
+		if (!VulkanIrisClient.irisStripped || Bench.ENABLED) return;
+		Minecraft mc = Minecraft.getInstance();
+		try {
+			if (Iris.keybindsRegistered()) Iris.handleKeybinds(mc);
+		} catch (Throwable t) {
+			Iris.logger.error("[Vulkan Iris] key binding failed", t);
+		}
+		if (!live) {
+			if (!FabricLoader.getInstance().isModLoaded("polydium") || !PolydiumAccess.vulkanActive()) return;
+			live = true;
+			LOG.info("live mode: Polydium runs on Vulkan; the selected Iris shader pack is drawn by Vulkan Iris");
+		}
+		if (mc.level == null && chain != null) {
+			liveStop();
+			liveGeneration = Integer.MIN_VALUE; // a new world builds the chain again
+		}
+	}
+
+	/** LevelRenderer.renderLevel RETURN, live mode: keeps the chain in sync with Iris's pack, then ends the pack's frame. */
+	private static void liveTick() {
+		try {
+			if (ctx == null) liveInit();
+			destroyer.collect();
+			if (chain != null && (liveFault != null || terrainFailed || vanillaFailed || shadowFailed)) {
+				String why = liveFault != null ? liveFault : terrainFailed ? "terrain draw failed" : vanillaFailed ? "entity draw failed" : "shadow pass failed";
+				liveFault = null;
+				liveFailed(why);
+				return;
+			}
+			if (PolydiumAccess.inRenderPass()) {
+				if (chain != null && chain.levelBegun()) liveFailed("level ended inside a Polydium render pass");
+				return;
+			}
+			if (!liveLoadTried) {
+				liveLoadTried = true;
+				// Iris on GL loads the pack once the game has loaded; here that is the first world frame
+				if (Iris.getCurrentPack().isEmpty()) Iris.loadShaderpack();
+			}
+			RenderTarget main = Minecraft.getInstance().getMainRenderTarget();
+			int gen = Iris.vulkanPackGeneration;
+			var dim = Iris.getCurrentDimension();
+			boolean resized = chain != null && (main.width != width || main.height != height);
+			boolean changed = gen != liveGeneration || !dim.equals(liveDimension);
+			if (chain != null && (changed || resized)) {
+				// the frame the old chain began (sky, terrain) is finished first, so the main target is complete
+				if (chain.levelBegun()) liveEndFrame(main);
+				liveStop();
+				if (resized) liveGeneration = Integer.MIN_VALUE;
+				return; // the new chain starts with the next frame
+			}
+			if (chain == null && changed && gen != liveFailedGeneration) liveStart(gen, dim);
+			if (chain == null) return;
+			liveEndFrame(main);
+		} catch (Throwable t) {
+			Iris.logger.error("[Vulkan Iris] frame failed", t);
+			liveFailed(t.toString());
+		}
+	}
+
+	private static void liveEndFrame(RenderTarget main) {
+		GpuImage color = mainColor(main);
+		GpuImage depth = mainDepth(main);
+		VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
+		PolydiumAccess.polydiumBarrier(cmd);
+		if (chain.hasTerrain()) {
+			if (!chain.levelBegun()) chain.beginLevel(cmd, tracker, color, depth, depthAttachment(main));
+			chain.endLevel(cmd, tracker);
+		} else {
+			chain.record(cmd, tracker, color, depth);
+		}
+		LayoutTracker.releaseExternal(color);
+		LayoutTracker.releaseExternal(depth);
+		PolydiumAccess.polydiumBarrier(cmd);
+	}
+
+	private static void liveInit() throws Exception {
+		ctx = PolydiumAccess.borrow(LOG);
+		alloc = GpuAllocator.borrow(ctx, PolydiumAccess.vma());
+		compiler = ShaderCompiler.forVulkan12();
+		clock = PolydiumAccess.frameClock();
+		destroyer = new DeferredDestroyer(clock, LOG);
+		ring = new DescriptorRing(ctx.device(), clock);
+		samplers = new SamplerCache(ctx.device());
+		tracker = new LayoutTracker();
+		Iris.initializeForVulkan();
+		IrisLimits.VK_CONFORMANCE = true;
+		LOG.info("live mode ready: " + PolydiumAccess.backendDescription());
+	}
+
+	private static void liveStart(int gen, net.irisshaders.iris.shaderpack.materialmap.NamespacedId dim) {
+		liveGeneration = gen;
+		liveDimension = dim;
+		var pack = Iris.getCurrentPack();
+		if (pack.isEmpty()) return; // shaders off: Polydium's vanilla rendering
+		packName = Iris.getCurrentPackName();
+		long t0 = System.nanoTime();
+		try {
+			ProgramSet set = pack.get().getProgramSet(dim);
+			RenderTarget main = Minecraft.getInstance().getMainRenderTarget();
+			width = main.width;
+			height = main.height;
+			chain = new PostChain(ctx, alloc, destroyer, clock, ring, samplers, compiler, set,
+				PolydiumAccess.vkFormat(main.getColorTexture()), PolydiumAccess.vkFormat(main.getDepthTexture()), width, height, true);
+			LOG.info(packName + " (" + dim + "): built " + chain.programCount() + " programs in " + ms(System.nanoTime() - t0));
+			for (String n : chain.notes()) LOG.info("  note: " + n);
+			liveFault = null;
+			if (chain.hasTerrain()) startTerrain();
+		} catch (Throwable t) {
+			Iris.logger.error("[Vulkan Iris] " + packName + " could not be built", t);
+			if (chain != null) {
+				chain.close();
+				chain = null;
+			}
+			liveFailedGeneration = gen;
+			tell("Vulkan Iris could not load " + packName + ": " + rootMessage(t) + ". Using vanilla rendering; press R to retry.");
+		}
+	}
+
+	/** Back to Polydium's vanilla rendering; the chain is destroyed once the frames using it have finished. */
+	private static void liveStop() {
+		stopTerrain();
+		if (chain != null) {
+			PostChain old = chain;
+			destroyer.defer("pack chain " + packName, old::close);
+			chain = null;
+		}
+	}
+
+	private static void liveFailed(String why) {
+		liveStop();
+		liveFailedGeneration = liveGeneration;
+		tell("Vulkan Iris stopped drawing " + packName + " (" + why + "). Using vanilla rendering; press R to retry.");
+	}
+
+	private static String rootMessage(Throwable t) {
+		Throwable r = t;
+		while (r.getCause() != null && r.getCause() != r) r = r.getCause();
+		return String.valueOf(r.getMessage() != null ? r.getMessage() : r);
+	}
+
+	/** Live mode: failures reported to the player (LiveTest checks it). */
+	static int liveFailures;
+
+	private static void tell(String message) {
+		liveFailures++;
+		Iris.logger.warn("[Vulkan Iris] " + message);
+		var player = Minecraft.getInstance().player;
+		if (player != null) {
+			player.displayClientMessage(net.minecraft.network.chat.Component.literal(message).withStyle(net.minecraft.ChatFormatting.RED), false);
+		}
+	}
+
+	/** Minecraft.close HEAD: frees Vulkan Iris's objects while Polydium's device still exists (live mode only). */
+	public static void shutdown() {
+		if (!live || ctx == null) return;
+		try {
+			stopTerrain();
+			vkQueueWaitIdle(ctx.graphicsQueue());
+			if (chain != null) chain.close();
+			chain = null;
+			destroyer.drainAll();
+			if (depthView != 0) vkDestroyImageView(ctx.device(), depthView, null);
+			depthView = 0;
+			ring.close();
+			samplers.close();
+			compiler.close();
+			LOG.info("live mode shut down; images left: " + alloc.liveImages());
+			alloc.close();
+			ctx.close();
+		} catch (Throwable t) {
+			Iris.logger.error("[Vulkan Iris] shutdown failed", t);
+		}
+		ctx = null;
+		live = false;
+	}
+
 }

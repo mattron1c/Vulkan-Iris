@@ -40,6 +40,14 @@ public final class GuiUtil {
 	 * Binds Iris's widgets texture to be
 	 * used for succeeding draw calls.
 	 */
+	/**
+	 * Vulkan Iris: whether the leftover GL state calls in Iris's widgets may run. On Polydium's Vulkan backend there is
+	 * no GL context (a GL call would crash), and the GUI's render pipelines set blending and depth themselves.
+	 */
+	public static boolean glState() {
+		return !net.irisshaders.iris.gl.shader.StandardMacros.isVulkanBackend();
+	}
+
 	public static void bindIrisWidgetsTexture() {
 		//RenderSystem.setShaderTexture(0, Minecraft.getInstance().getTextureManager().getTexture(IRIS_WIDGETS_TEX).getTextureView(), RenderSystem.getSamplerCache().getSampler(AddressMode.CLAMP_TO_EDGE, AddressMode.CLAMP_TO_EDGE, FilterMode.NEAREST, FilterMode.NEAREST));
 	}
@@ -66,7 +74,7 @@ public final class GuiUtil {
 		int vOffset = disabled ? 46 : hovered ? 86 : 66;
 
 		// Sets RenderSystem to use solid white as the tint color for blend mode, and enables blend mode
-		GlStateManager._enableBlend();
+		if (GuiUtil.glState()) GlStateManager._enableBlend();
 
 		// Top left section
 		guiGraphics.blit(RenderPipelines.GUI_TEXTURED, IRIS_WIDGETS_TEX, x, y, 0, vOffset, halfWidth, halfHeight, 256, 256);
@@ -194,7 +202,7 @@ public final class GuiUtil {
 		 */
 		public void draw(GuiGraphics guiGraphics, int x, int y) {
 			// Sets RenderSystem to use solid white as the tint color for blend mode (1.16), and enables blend mode
-			GlStateManager._enableBlend();
+			if (GuiUtil.glState()) GlStateManager._enableBlend();
 
 			// Draw the texture to the screen
 			guiGraphics.blit(RenderPipelines.GUI_TEXTURED, IRIS_WIDGETS_TEX, x, y, u, v, width, height, 256, 256);

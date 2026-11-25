@@ -4,17 +4,20 @@
   "provides": ["iris"],
   "version": "${version}",
   "name": "Vulkan Iris",
-  "description": "Unofficial fork of Iris Shaders working towards a native Vulkan backend. Based on Iris by coderbot, IMS212 and contributors.",
+  "description": "Unofficial fork of Iris Shaders that draws OptiFine/Iris shader packs natively on Vulkan (with Polydium's Vulkan backend on 1.21.11). Without Polydium on Vulkan it is Iris on OpenGL. Based on Iris by coderbot, IMS212 and contributors.",
   "authors": [
     "coderbot",
     "IMS212",
     "Justsnoopy30",
     "FoundationGames"
   ],
+  "contributors": [
+    "mattron1c (Vulkan backend)"
+  ],
   "contact": {
-    "homepage": "https://github.com/IrisShaders/Iris",
-    "sources": "https://github.com/IrisShaders/Iris.git",
-    "issues": "https://github.com/IrisShaders/Iris/issues"
+    "homepage": "https://github.com/mattron1c/Vulkan-Iris",
+    "sources": "https://github.com/mattron1c/Vulkan-Iris",
+    "issues": "https://github.com/mattron1c/Vulkan-Iris/issues"
   },
   "license": "LGPL-3.0-only",
   "icon": "assets/iris/textures/gui/iris-logo.png",
@@ -44,10 +47,15 @@
   "accessWidener": "iris.accesswidener",
   "depends": {
     "fabricloader": ">=0.12.3",
+    "minecraft": "1.21.11",
+    "java": ">=21",
 
     "sodium": [
       "0.8.x"
     ]
+  },
+  "recommends": {
+    "polydium": ">=1.4.21"
   },
   "breaks": {
     "embeddium": "*",

@@ -53,6 +53,11 @@ public final class GpuImage {
 	public long image() { return image; }
 	public long view() { return view; }
 
+	/** Mip levels (1 unless created with a mip chain; {@link #view()} is level 0, {@link #sampleView()} all levels). */
+	int mipLevels = 1;
+
+	public int mipLevels() { return mipLevels; }
+
 	/** A second view used only for sampling (e.g. a swizzled depth view); 0 = sample through {@link #view()}. */
 	long sampleView;
 

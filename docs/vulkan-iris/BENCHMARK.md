@@ -33,7 +33,47 @@ No performance claim about Vulkan Iris is made without these numbers. Where Vulk
 - **GPU time per stage on GL:** the same flag on `prodBenchGl` (`GlStageTimer` in Iris's pipeline).
 - Packs run one after another in one game session per side, in the same order. A and B never run at the same time.
 
-## Results — 2026-11-25, NVIDIA RTX 5060 (driver 610.88), current
+## Results — 2026-11-25 (afternoon), NVIDIA RTX 5060 (driver 610.88), current
+A and B both re-run back to back on the same build: live mode, real mipmaps for mipmapped colortex buffers,
+`independentBlend` enabled on Polydium's device, and the noise-texture filtering fix. One run per side, 60 s per pack
+after a 20 s warm-up, nothing else using the GPU (checked before the run started).
+
+| pack | A average FPS | B average FPS | Δ average | A 1 % low | B 1 % low | Δ 1 % low | A / B worst frame |
+|---|---|---|---|---|---|---|---|
+| *no pack (shaders off): the backend alone* | 1094 | 2966 | +171 % | 447 | 882 | +97 % | 30.0 / 14.7 ms |
+| Bliss | 434 | 509 | +17 % | 242 | 262 | +8 % | 17.1 / 13.0 ms |
+| BSL | 423 | 402 | −5 % | 259 | 225 | −13 % | 15.3 / 12.4 ms |
+| Complementary Reimagined | 354 | 372 | +5 % | 208 | 213 | +2 % | 17.7 / 14.4 ms |
+| Complementary Unbound | 395 | 345 | −13 % | 227 | 206 | −10 % | 16.6 / 17.2 ms |
+| MakeUp UltraFast | 596 | 897 | +50 % | 325 | 441 | +36 % | 11.2 / 12.1 ms |
+| Mellow | 690 | 1451 | +110 % | 351 | 575 | +64 % | 14.6 / 12.3 ms |
+| miniature | 541 | 1175 | +117 % | 275 | 505 | +84 % | 16.4 / 31.3 ms |
+| Noble | 274 | 327 | +19 % | 167 | 205 | +22 % | 18.5 / 22.3 ms |
+| Sildur's Vibrant Extreme | 385 | 495 | +29 % | 204 | 275 | +35 % | 14.1 / 26.7 ms |
+| Solas | 316 | 302 | −5 % | 181 | 215 | +19 % | 23.0 / 9.3 ms |
+
+- **Average FPS:** B is ahead in 7 packs: miniature +117 %, Mellow +110 %, MakeUp +50 %, Sildur's +29 %,
+  Noble +19 %, Bliss +17 % and Complementary Reimagined +5 %. B is behind in 3: Complementary Unbound −13 %, and BSL and Solas −5 % each.
+- **1 % lows:** B is ahead in 8 packs and behind in 2 (BSL −13 %, Complementary Unbound −10 %).
+- **Read with care:**
+  - Part of the change against the morning run is on the A side. This A run is lower than the first GL run in
+    Mellow (690 against 836) and Complementary Reimagined (354 against 412), with unchanged GL code.
+  - B's own averages against the morning B run: Mellow 1322 → 1451 (+10 %), MakeUp 823 → 897 (+9 %), Noble
+    302 → 327 (+8 %), Sildur's 458 → 495 (+8 %), miniature 1123 → 1175 (+5 %), Bliss 486 → 509 (+5 %), BSL
+    389 → 402 (+3 %), Solas 293 → 302 (+3 %), Complementary Reimagined 370 → 372 and Complementary Unbound
+    349 → 345 (flat).
+  - Single runs: treat differences under about 5 % (averages) and 15 % (1 % lows) as noise.
+- **Where B still loses: BSL's translucent terrain.**
+  - BSL's `gbuffers_water` takes 0.53 ms on B, against 0.14 ms for GL's whole translucent window.
+  - Measured on B, the pass costs 0.013 ms with its draws skipped and 0.057 ms with the scissor clipped to 1×1
+    pixel. So about 0.48 ms is fragment work, not barriers, layout changes or vertex work.
+  - The water fragment shader runs a 30-step screen-space reflection march and a volumetric cloud march (up to 32
+    samples) for the reflected sky. With `CLOUDS=1` (skybox clouds) the pass took about 40 % less. That run had
+    another program loading the GPU, so it shows the direction only, not a number.
+  - Why the same shader is slower on Vulkan than on GL is not found yet. Next steps: compare the SPIR-V
+    (`-Dvulkaniris.dumpShaders=true` writes the translated GLSL) and the GL driver's compiled output.
+
+## Earlier result — 2026-11-25 (morning)
 B with every fix below: the frame-spike fix, Iris's shadow-pass rule, `size.buffer`, and fewer barriers. A is the
 first GL run (2026-11-24). Two later GL runs were within ±5 % of it in average FPS, pack by pack. One B run, 60 s per
 pack after a 20 s warm-up.

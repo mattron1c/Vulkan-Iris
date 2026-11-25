@@ -172,6 +172,15 @@ fun registerProdSelfTest(name: String, flag: String) =
         mods.from(tasks.named("remapJar"))
         mods.from(SODIUM_DEPENDENCY_FABRIC)
         mods.from(fileTree(rootDir.resolve("run-deps/polydium")) { include("*.jar") })
+        // compatibility runs: -Dvulkaniris.compat.mods=<a mods folder> adds that folder's jars (not its own copies of
+        // Sodium, Iris, Polydium and the libraries above, which this run already provides)
+        System.getProperty("vulkaniris.compat.mods")?.let { dir ->
+            mods.from(fileTree(dir) {
+                include("*.jar")
+                exclude("sodium-fabric-*", "iris-*", "polydium-*", "polycompose-*", "fabric-api-*", "fabric-language-kotlin-*", "OneConfig-*")
+                System.getProperty("vulkaniris.compat.exclude")?.split(",")?.forEach { exclude(it.trim()) }
+            })
+        }
         jvmArgs.addAll("-Dorg.lwjgl.system.stackSize=256", "-D$flag=true")
         // e.g. gradlew :fabric:prodPhase6 -Dvulkaniris.phase6.packs=bsl,complementary
         System.getProperty("vulkaniris.phase6.packs")?.let { jvmArgs.add("-Dvulkaniris.phase6.packs=$it") }
@@ -204,6 +213,11 @@ registerProdSelfTest("prodPhase5", "vulkaniris.phase5.selftest")
 registerProdSelfTest("prodPhase6", "vulkaniris.phase6.selftest")
 // gradlew :fabric:prodPhase7 — Phase 6 test with terrain drawn by each pack's gbuffers_terrain/_cutout/_water programs
 registerProdSelfTest("prodPhase7", "vulkaniris.phase7.selftest")
+// gradlew :fabric:prodLive — the player's path (no harness): pack selection, reload, toggle, switch, resize, quit
+registerProdSelfTest("prodLive", "vulkaniris.live.test").configure {
+    System.getProperty("vulkaniris.live.packs")?.let { jvmArgs.add("-Dvulkaniris.live.packs=$it") }
+    System.getProperty("vulkaniris.live.gallery")?.let { jvmArgs.add("-Dvulkaniris.live.gallery=$it") }
+}
 
 // A/B benchmark (docs/vulkan-iris/BENCHMARK.md). B: Vulkan Iris on Polydium, through the Phase 7 harness in bench mode
 registerProdSelfTest("prodBenchVulkan", "vulkaniris.phase7.selftest").configure { jvmArgs.add("-Dvulkaniris.bench=true") }

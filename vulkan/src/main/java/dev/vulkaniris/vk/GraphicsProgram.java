@@ -19,6 +19,15 @@ import static org.lwjgl.vulkan.VK10.*;
  * Single descriptor set (set 0), dynamic rendering, dynamic viewport/scissor.
  */
 public final class GraphicsProgram implements AutoCloseable {
+	/**
+	 * Whether the device enabled {@code independentBlend} (different blend states per colour attachment, used by packs'
+	 * per-buffer {@code blend.<program>.<buffer>} directives). The owner of a borrowed device decides; when it is off,
+	 * a pipeline whose attachments differ gets one shared state instead and is listed in {@link #sharedBlendPrograms}.
+	 */
+	public static volatile boolean independentBlend = true;
+	/** Programs built with one shared blend state because {@link #independentBlend} is off. */
+	public static final java.util.Set<String> sharedBlendPrograms = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
 	public enum Stage {
 		VERTEX(VK_SHADER_STAGE_VERTEX_BIT), TESS_CONTROL(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT),
 		TESS_EVAL(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT), GEOMETRY(VK_SHADER_STAGE_GEOMETRY_BIT), FRAGMENT(VK_SHADER_STAGE_FRAGMENT_BIT);
@@ -132,9 +141,23 @@ public final class GraphicsProgram implements AutoCloseable {
 			}
 
 			int n = spec.colorFormats().length;
+			Blend[] blends = spec.blends() == null ? new Blend[n] : spec.blends().clone();
+			if (!independentBlend) {
+				// without the independentBlend feature every attachment must use the same blend state
+				boolean differ = false;
+				for (int i = 1; i < n; i++) differ |= !java.util.Objects.equals(blends[i], blends[0]);
+				if (differ) {
+					boolean anyUnblended = false;
+					for (Blend bl : blends) anyUnblended |= bl == null;
+					// a null entry may be an integer target, which must not blend: then none blends
+					Blend shared = anyUnblended ? null : blends[0];
+					java.util.Arrays.fill(blends, shared);
+					sharedBlendPrograms.add(spec.name());
+				}
+			}
 			VkPipelineColorBlendAttachmentState.Buffer blend = VkPipelineColorBlendAttachmentState.calloc(Math.max(1, n), stack);
 			for (int i = 0; i < n; i++) {
-				Blend bl = spec.blends() == null ? null : spec.blends()[i];
+				Blend bl = blends[i];
 				blend.get(i).colorWriteMask(spec.raster().colorWriteMask()).blendEnable(bl != null);
 				if (bl != null) {
 					blend.get(i).srcColorBlendFactor(bl.srcColor()).dstColorBlendFactor(bl.dstColor()).colorBlendOp(VK_BLEND_OP_ADD)

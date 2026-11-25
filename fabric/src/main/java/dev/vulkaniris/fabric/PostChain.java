@@ -16,6 +16,7 @@ import net.irisshaders.iris.pipeline.programs.ShaderKey;
 import net.irisshaders.iris.uniforms.VanillaUniforms;
 import dev.vulkaniris.vk.ComputeProgram;
 import dev.vulkaniris.vk.DescriptorRing;
+import dev.vulkaniris.vk.MipChain;
 import dev.vulkaniris.vk.DescriptorWrites;
 import dev.vulkaniris.vk.DeferredDestroyer;
 import dev.vulkaniris.vk.FrameClock;
@@ -244,6 +245,8 @@ final class PostChain implements AutoCloseable {
 		long stride;
 		final long[] slotSubmit = new long[SLOTS];
 		boolean usesSsbo;
+		/** Iris mipmap.<program>.colortexN: buffers given mipmaps just before this pass, which samples them with mipmaps. */
+		Set<Integer> mipmapped = Set.of();
 		/** A shadowcomp pass: the shadowcolors it reads from "alt" (Iris pass.stageReadsFromAlt); it writes the other one. */
 		Set<Integer> shadowReadsAlt;
 	}
@@ -518,10 +521,15 @@ final class PostChain implements AutoCloseable {
 		for (int i : used) formats[i] = VkFormats.of(targetFormats[i]);
 		// Iris RenderTargets: each colortex at PackDirectives.getTextureScaleOverride (size.buffer.colortexN); a pass then
 		// renders at its draw buffers' size (GraphicsProgram.draw takes the first output's), as Iris's CompositeRenderer
+		boolean[] mipmapped = new boolean[RenderTargetSet.MAX_TARGETS];
+		List<Pass> all = new ArrayList<>();
+		passes.values().forEach(all::addAll);
+		if (finalPass != null) all.add(finalPass);
+		for (Pass q : all) for (int i : q.mipmapped) if (i >= 0 && i < mipmapped.length && formats[i] != 0) mipmapped[i] = true;
 		this.targets = new RenderTargetSet(alloc, destroyer, formats, width, height, (i, w, h) -> {
 			org.joml.Vector2i v = directives.getTextureScaleOverride(i, w, h);
 			return new int[]{v.x, v.y};
-		});
+		}, mipmapped);
 		for (int i : used) {
 			org.joml.Vector2i v = directives.getTextureScaleOverride(i, width, height);
 			if (v.x != width || v.y != height) notes.add("colortex" + i + " sized " + v.x + "x" + v.y + " for a " + width + "x" + height + " screen (size.buffer)");
@@ -547,6 +555,9 @@ final class PostChain implements AutoCloseable {
 	}
 
 	Set<String> notes() {
+		for (String name : GraphicsProgram.sharedBlendPrograms) {
+			notes.add(name + ": per-buffer blend modes share one state (the GPU lacks independentBlend)");
+		}
 		return notes;
 	}
 
@@ -579,7 +590,10 @@ final class PostChain implements AutoCloseable {
 			if (!shadowcomp) for (int b : p.drawBuffers) used.add(b);
 		}
 		if (d.getViewportScale() != null && d.getViewportScale().scale() != 1.0f) notes.add(p.name + ": viewport scale ignored (not implemented yet)");
-		if (!d.getMipmappedBuffers().isEmpty()) notes.add(p.name + ": mipmapped buffers sampled without mipmaps (not implemented yet)");
+		if (!d.getMipmappedBuffers().isEmpty()) {
+			if (shadowcomp) notes.add(p.name + ": mipmapped shadow buffers sampled without mipmaps (not implemented yet)");
+			else p.mipmapped = d.getMipmappedBuffers();
+		}
 
 		Map<PatchShaderType, String> gl = TransformPatcher.patchComposite(p.name, src.getVertexSource().orElse(null),
 			src.getGeometrySource().orElse(null), src.getFragmentSource().orElse(null), stage, directives.getTextureMap());
@@ -801,6 +815,22 @@ final class PostChain implements AutoCloseable {
 	 * patch with patchSodium, then pick the chunk vertex format from the attributes the programs read
 	 * (FormatAnalyzer, as Iris does after linking).
 	 */
+	/** {@code -Dvulkaniris.dumpShaders=true}: the Vulkan GLSL of each terrain program, in vulkaniris-shaders/ (for bug reports). */
+	private static final boolean DUMP_SHADERS = Boolean.getBoolean("vulkaniris.dumpShaders");
+
+	private static void dumpShaders(String name, VulkanGlslTranslator.Result vk) {
+		if (!DUMP_SHADERS) return;
+		try {
+			java.nio.file.Path dir = net.minecraft.client.Minecraft.getInstance().gameDirectory.toPath().resolve("vulkaniris-shaders");
+			java.nio.file.Files.createDirectories(dir);
+			for (var e : vk.sources().entrySet()) {
+				java.nio.file.Files.writeString(dir.resolve(name.replaceAll("[^A-Za-z0-9_.-]", "_") + "." + e.getKey().name().toLowerCase()), e.getValue());
+			}
+		} catch (java.io.IOException e) {
+			net.irisshaders.iris.Iris.logger.warn("[Vulkan Iris] could not dump " + name, e);
+		}
+	}
+
 	private void buildTerrain(ShaderCompiler compiler, Set<Integer> used) {
 		ProgramFallbackResolver resolver = new ProgramFallbackResolver(set);
 		// 0-2: gbuffers terrain solid / cutout / water; 3-5: shadow solid / cutout / water (Iris SodiumPrograms.Pass)
@@ -819,6 +849,7 @@ final class PostChain implements AutoCloseable {
 			Map<PatchShaderType, String> gl = TransformPatcher.patchSodium(src.getName(), src.getVertexSource().orElse(null),
 				src.getGeometrySource().orElse(null), null, null, src.getFragmentSource().orElse(null), alpha[k], directives.getTextureMap());
 			vk[k] = VulkanGlslTranslator.translate(gl, gbufferWriter::provides, List.of("u_RegionOffset", "iris_CurrentTime"));
+			dumpShaders((k < 3 ? "" : "shadow_") + src.getName() + "_" + k, vk[k]);
 			// Iris SodiumPrograms: the chunk format carries what any of its passes reads, shadow passes included
 			var a = vk[k].attributes();
 			blockId |= a.containsKey("mc_Entity");
@@ -2189,7 +2220,10 @@ final class PostChain implements AutoCloseable {
 			CustomTextureData custom = set.getPack().getCustomNoiseTexture();
 			if (custom instanceof CustomTextureData.PngData png) {
 				BufferedImage img = decode(png.getContent(), "noisetex");
-				return new Fixed(upload("noisetex", img.getWidth(), img.getHeight(), argbToRgba(img)), SamplerCache.LINEAR_REPEAT_MIPS);
+				// Iris NativeImageBackedCustomTexture: the .mcmeta's blur/clamp, NEAREST + REPEAT when it has none
+				boolean blur = png.getFilteringData().shouldBlur(), clamp = png.getFilteringData().shouldClamp();
+				return new Fixed(upload("noisetex", img.getWidth(), img.getHeight(), argbToRgba(img)), new SamplerCache.Key(
+					blur ? SamplerCache.Filter.LINEAR : SamplerCache.Filter.NEAREST, clamp ? SamplerCache.Address.CLAMP : SamplerCache.Address.REPEAT, false, false));
 			}
 			if (custom != null) notes.add("custom noise texture of type " + custom.getClass().getSimpleName() + " not loaded yet; using Iris's generated noise");
 			// Iris's NativeImageBackedNoiseTexture: Random(0), one int per pixel, x-major, alpha forced to 255
@@ -2315,6 +2349,8 @@ final class PostChain implements AutoCloseable {
 	private GpuImage mainColor, mainDepth, mainDepthAttachment, depthNoTranslucent, depthNoHand;
 	private boolean levelBegun, translucentDone, handCopied;
 	private TerrainInputs terrainInputs;
+	/** Iris turnOnMips: LINEAR_MIPMAP_LINEAR on a mipmapped colortex (clamped, like every colortex). */
+	private static final SamplerCache.Key MIPMAP_SAMPLER = new SamplerCache.Key(SamplerCache.Filter.LINEAR, SamplerCache.Address.CLAMP, true, false);
 	private static final SamplerCache.Key ATLAS_SAMPLER = new SamplerCache.Key(SamplerCache.Filter.NEAREST, SamplerCache.Address.REPEAT, true, false);
 
 	boolean levelBegun() {
@@ -2524,6 +2560,10 @@ final class PostChain implements AutoCloseable {
 	private long staleRegions;
 
 	/** Region draws skipped because the region was still meshed in another vertex format. */
+
+	/** Per terrain kind (solid, cutout, translucent): regions, indexed draw calls and indices drawn. */
+	final long[][] terrainStats = new long[3][3];
+
 	long staleRegions() {
 		return staleRegions;
 	}
@@ -2545,6 +2585,11 @@ final class PostChain implements AutoCloseable {
 		for (int i = 0; i < outs.length; i++) outs[i] = targets.read(g.drawBuffers[i]);
 		if (GpuTimer.PER_PASS) gpuMark("terrain " + g.name + " start");
 		drawRegions(g, outs, mainDepthAttachment, draws);
+		if (kind >= 0 && kind < 3) for (RegionDraw d : draws) {
+			terrainStats[kind][0]++;
+			terrainStats[kind][1] += d.count().length;
+			for (int c : d.count()) terrainStats[kind][2] += c;
+		}
 		if (GpuTimer.PER_PASS) gpuMark("terrain " + g.name + " end");
 		endSegment();
 	}
@@ -3121,7 +3166,17 @@ final class PostChain implements AutoCloseable {
 			outs = new GpuImage[p.drawBuffers.length];
 			for (int i = 0; i < outs.length; i++) outs[i] = targets.write(p.drawBuffers[i]);
 		}
+		// Iris CompositeRenderer.setupMipmapping: the read side of each mipmapped buffer gets fresh mipmaps first
+		for (int b : p.mipmapped) if (targets.has(b)) MipChain.generate(cmd, tracker, targets.read(b));
 		Resolved r = new Resolved(p.bounds, mainDepth);
+		if (!p.mipmapped.isEmpty()) {
+			for (int i = 0; i < r.images.length; i++) {
+				if (p.bounds.get(i).source() instanceof Target t && p.mipmapped.contains(t.index()) && r.images[i].mipLevels() > 1
+					&& !VkFormats.isInteger(targetFormats[t.index()])) {
+					r.sampler[i] = samplers.get(MIPMAP_SAMPLER);
+				}
+			}
+		}
 		for (GpuImage o : outs) {
 			if (r.sampled.contains(o) || r.storage.contains(o)) throw new IllegalStateException(p.name + " reads and renders to " + o.name());
 		}

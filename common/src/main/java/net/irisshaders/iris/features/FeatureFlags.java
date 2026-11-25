@@ -11,18 +11,25 @@ import java.util.function.BooleanSupplier;
 public enum FeatureFlags {
 	SEPARATE_HARDWARE_SAMPLERS(() -> true, () -> true),
 	HIGHER_SHADOWCOLOR(() -> true, () -> true),
-	CUSTOM_IMAGES(() -> true, IrisRenderSystem::supportsImageLoadStore),
-	PER_BUFFER_BLENDING(() -> true, IrisRenderSystem::supportsBufferBlending),
-	COMPUTE_SHADERS(() -> true, IrisRenderSystem::supportsCompute),
-	TESSELLATION_SHADERS(() -> true, IrisRenderSystem::supportsTesselation),
+	// Vulkan Iris: on the Vulkan backend the answers are what Vulkan Iris implements, not GL queries (there is no GL
+	// context; IrisRenderSystem is GL-only)
+	CUSTOM_IMAGES(() -> true, () -> vulkan() || IrisRenderSystem.supportsImageLoadStore()),
+	PER_BUFFER_BLENDING(() -> true, () -> vulkan() ? VulkanFeatures.independentBlend : IrisRenderSystem.supportsBufferBlending()),
+	COMPUTE_SHADERS(() -> true, () -> vulkan() || IrisRenderSystem.supportsCompute()),
+	// tessellation programs aren't implemented in Vulkan Iris yet
+	TESSELLATION_SHADERS(() -> !vulkan(), () -> vulkan() || IrisRenderSystem.supportsTesselation()),
 	ENTITY_TRANSLUCENT(() -> true, () -> true),
 	REVERSED_CULLING(() -> true, () -> true),
 	BLOCK_EMISSION_ATTRIBUTE(() -> true, () -> true),
 	CAN_DISABLE_WEATHER(() -> true, () -> true),
-	SSBO(() -> true, IrisRenderSystem::supportsSSBO),
+	SSBO(() -> true, () -> vulkan() || IrisRenderSystem.supportsSSBO()),
 	FADE_VARIABLE(() -> true, () -> true),
 	TEXTURE_FILTERING(() -> true, () -> true),
 	UNKNOWN(() -> false, () -> false);
+
+	private static boolean vulkan() {
+		return net.irisshaders.iris.gl.shader.StandardMacros.isVulkanBackend();
+	}
 
 	private final BooleanSupplier irisRequirement;
 	private final BooleanSupplier hardwareRequirement;

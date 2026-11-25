@@ -63,11 +63,24 @@ public final class GpuAllocator implements AutoCloseable {
 
 	/** Device-local 2D image + full-image view. */
 	public GpuImage createImage(String name, int format, int width, int height, int usage, int aspect) {
+		return createImage(name, format, width, height, usage, aspect, 1);
+	}
+
+	/** Mip levels for a full chain down to 1x1. */
+	public static int fullMipChain(int width, int height) {
+		return 32 - Integer.numberOfLeadingZeros(Math.max(1, Math.max(width, height)));
+	}
+
+	/**
+	 * As above with {@code mipLevels} levels. The image's {@link GpuImage#view()} is level 0 only (a render
+	 * attachment must be one level); with more than one level, {@link GpuImage#sampleView()} covers them all.
+	 */
+	public GpuImage createImage(String name, int format, int width, int height, int usage, int aspect, int mipLevels) {
 		if (width <= 0 || height <= 0) throw new IllegalArgumentException(name + ": bad size " + width + "x" + height);
 		VkDevice dev = ctx.device();
 		try (MemoryStack stack = stackPush()) {
 			VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default().imageType(VK_IMAGE_TYPE_2D).format(format)
-				.extent(e -> e.set(width, height, 1)).mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
+				.extent(e -> e.set(width, height, 1)).mipLevels(Math.max(1, mipLevels)).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
 				.tiling(VK_IMAGE_TILING_OPTIMAL).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
 			VmaAllocationCreateInfo aci = VmaAllocationCreateInfo.calloc(stack).usage(VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 			if ((usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0) {
@@ -78,19 +91,33 @@ public final class GpuAllocator implements AutoCloseable {
 			VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
 			VkCheck.check(vmaCreateImage(vma, ici, aci, pImage, pAlloc, info), "vmaCreateImage(" + name + " " + width + "x" + height + ")");
 			long image = pImage.get(0), alloc = pAlloc.get(0);
-			long view;
+			long view, mipView = 0L;
+			int levels = Math.max(1, mipLevels);
 			try {
 				VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_2D)
 					.format(format).subresourceRange(r -> r.aspectMask(aspect).levelCount(1).layerCount(1));
 				VkCheck.check(vkCreateImageView(dev, vci, null, pImage), "vkCreateImageView(" + name + ")");
 				view = pImage.get(0);
+				if (levels > 1) {
+					vci.subresourceRange().levelCount(levels);
+					try {
+						VkCheck.check(vkCreateImageView(dev, vci, null, pImage), "vkCreateImageView(" + name + " mips)");
+					} catch (RuntimeException e) {
+						vkDestroyImageView(dev, view, null);
+						throw e;
+					}
+					mipView = pImage.get(0);
+				}
 			} catch (RuntimeException e) {
 				vmaDestroyImage(vma, image, alloc);
 				throw e;
 			}
 			imageBytes.addAndGet(info.size());
 			liveImages.incrementAndGet();
-			return new GpuImage(name, image, view, alloc, info.size(), format, width, height, aspect, false);
+			GpuImage img = new GpuImage(name, image, view, alloc, info.size(), format, width, height, aspect, false);
+			img.mipLevels = levels;
+			img.sampleView = mipView;
+			return img;
 		}
 	}
 
