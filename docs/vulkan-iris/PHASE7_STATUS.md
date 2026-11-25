@@ -99,8 +99,9 @@ same regions and batches Polydium would. These facts were read from Polydium's b
   past its end. None occurred in the tests.
 
 ## Not implemented yet (reported in the notes, never faked)
-- **7c leftover:** Iris's extended entity vertex format (`iris_Entity`, entity `mc_midTexCoord` / `at_tangent`) reads GL's
-  default (0,0,0,1), and the `entityId` / `blockEntityId` uniforms are not driven. See "Entity IDs" in the 7c section.
+- **7c leftover:** `iris_Entity` / `mc_Entity` of Iris's extended entity vertex format read GL's default (0,0,0,1), and
+  the `entityId` / `blockEntityId` uniforms are not driven. See "Entity IDs" in the 7c section. (`at_tangent` and
+  `mc_midTexCoord` are derived since 7e, see [7e: derived at_tangent / mc_midTexCoord](#slice-7e--derived-at_tangent--mc_midtexcoord).)
 - **7d:** no shadow pass: `shadow*` samplers are a "nothing occludes" stand-in, and `shadowcomp` doesn't run.
 - **depthtex in gbuffers:** depthtex0/1/2 read the depth before translucent terrain. In the opaque passes that is the previous frame's copy.
   GL would sample the depth buffer being drawn.
@@ -208,7 +209,9 @@ through an extended vertex format. It needs three things:
 Porting it on Polydium is not a contained change. The widened buffers would also reach the Polydium pipelines this
 fork doesn't redirect, such as GUI items, and those still expect vanilla's vertex layout. An ID per draw is not an
 option either: entities are batched by render type, so one draw holds many entities. Until this is ported, the
-attributes read GL's default (0,0,0,1) and every affected program says so in the notes.
+ID attributes read GL's default (0,0,0,1) and every affected program says so in the notes. The two attributes that
+depend only on the quad's own vertices, `at_tangent` and `mc_midTexCoord`, are computed in the vertex shader since 7e
+(see [below](#slice-7e--derived-at_tangent--mc_midtexcoord)).
 
 # Slice 7d — shadow pass (terrain)
 
@@ -315,13 +318,15 @@ The table comes from the 3-pack run.
 - **A/B switch.** `-Dvulkaniris.phase7.noentityshadow=true` draws terrain-only shadows.
 
 ### Limits
-- entity attributes (`iris_Entity`, `mc_Entity`, `mc_midTexCoord`, `at_midBlock`) read GL's default (0,0,0,1) here
-  as in the main pass, because Iris's extended entity vertex format isn't ported (see "Entity IDs" above)
+- entity ID attributes (`iris_Entity`, `mc_Entity`, `at_midBlock`) read GL's default (0,0,0,1) here as in the main
+  pass, because Iris's extended entity vertex format isn't ported (see "Entity IDs" above); `at_tangent` and
+  `mc_midTexCoord` are derived since 7e
 - the glowing-entity outline buffer of the shadow pass isn't redirected: such passes aren't on the main target, so
   Polydium draws them as vanilla into the outline target (not checked against Iris on GL; the test scene has no glowing entities)
 
 ## Found, not caused by 7d
-- **Noble's translucent hand is black.** The light-blue glass in the off hand renders black, with or without shadow draws.
+- **Noble's translucent hand is black.** ~~The light-blue glass in the off hand renders black, with or without shadow draws.~~
+  **Fixed in 7e** by [deriving `at_tangent`](#slice-7e--derived-at_tangent--mc_midtexcoord).
   **Diagnosed (7e):** not the hand pass. Noble's forward program (`programs/gbuffers/forward.glsl`, used by
   `gbuffers_hand_water`) builds its TBN from `at_tangent`. Iris supplies that through its extended entity vertex
   format, which isn't ported (see "Entity IDs"), so here the attribute reads GL's default (0,0,0,1) and
@@ -332,3 +337,49 @@ The table comes from the 3-pack run.
   Iris derives `at_tangent` and `mc_midTexCoord` per quad from the vertices (`NormalHelper.computeTangent`,
   the quad's mean UV), so they can be derived on Vulkan without widening Polydium's vertex buffers;
   `mc_Entity` / `iris_Entity` can't.
+
+# Slice 7e — derived at_tangent / mc_midTexCoord
+
+**Result:** Noble's off-hand glass is light blue, no longer black, and its chests and entities are no longer darkened
+([screenshot](phase7/7e-noble-derived-tangent.png)). `prodPhase7` and `prodPhase6` both pass 10 / 10.
+
+Iris fills `at_tangent` and `mc_midTexCoord` on the CPU, for every quad (and triangle) of its extended vertex formats
+(`MixinBufferBuilder.fillExtendedData`, with FabricMC's `NormalHelper`). Polydium's vertex buffers keep vanilla's
+layout, so here the vertex shader computes the same values from the draw's own vertices:
+
+- **Translator.** `VulkanGlslTranslator.deriveQuadAttributes` removes the `at_tangent` / `mc_midTexCoord` inputs a program
+  uses and turns them into globals. It then prepends `main` with `iris_deriveQuad()`, a GLSL port of `fillExtendedData`:
+  - quads: face normal from the diagonals, then `computeTangent` on vertices 0-1-2
+  - triangles: the vertex normal, with positions projected onto its plane (`computeTangentSmooth`)
+  - `mc_midTexCoord`: the mean UV
+  - the tangent is rounded like `NormI8.pack` (truncated to 1/127 steps), and NaN becomes 0
+- **Data.** The draw's vertex buffer is bound as a `usamplerBuffer` (R32_UINT view), and push constants give the
+  primitive mode, the first vertex, the stride and the position / UV0 / normal word offsets. The quad is found from
+  `gl_VertexIndex`.
+- **Buffers.** Polydium uploads the immediate draws (entities, block entities, the hand, text) into one ring
+  (`ImmediateDrawRing`, usage vertex | index | map-write). A mixin adds uniform-texel-buffer usage to it; a second one
+  does the same for vanilla's own immediate buffers (`VertexFormat.uploadToBuffer`), used when the ring is off. Same
+  sizes, memory and uploads.
+- **Scope.** As in Iris, only `NEW_ENTITY`, `BLOCK` and `POSITION_COLOR_TEX_LIGHTMAP` in `QUADS` / `TRIANGLES` mode are
+  derived. Other draws (the sky, particles) keep GL's default, and the report lists each skipped pipeline with its reason.
+
+Draws that derived the attributes, per pack (`prodPhase7`, Phase 7 report line "derived at_tangent / mc_midTexCoord"):
+| pack | draws |
+|---|---|
+| Bliss | 7 226 |
+| BSL | 3 916 |
+| Complementary Reimagined | 6 898 |
+| Complementary Unbound | 6 833 |
+| MakeUp UltraFast | 0 (its programs read neither attribute) |
+| Mellow | 7 225 |
+| miniature | 0 (its programs read neither attribute) |
+| Noble | 7 969 |
+| Sildur's Vibrant Extreme | 3 952 |
+| Solas | 990 |
+
+### Limits
+- `iris_Entity` / `mc_Entity` / `at_midBlock` are still GL's default: they need the entity being rendered, not the
+  vertices (see "Entity IDs").
+- Iris also overwrites a quad's normal with the face normal it computes. Here `iris_Normal` stays vanilla's per-vertex
+  normal, which for entity quads is normally the same face normal.
+- No A/B performance numbers yet: per vertex, it is 4 position fetches, 4 UV fetches and a few dozen ALU ops.

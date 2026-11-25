@@ -252,6 +252,150 @@ public final class VulkanGlslTranslator {
 			pushed, Std140Type.align(pushOffset, 4));
 	}
 
+	// ------------------------------------------------------------------ extended vertex attributes derived per quad
+
+	/** Per-draw push constants of {@link #deriveQuadAttributes}: (mode 0/3/4, first vertex, stride words, position word). */
+	public static final String QUAD_INFO = "iris_QuadInfo";
+	/** (UV0 word, normal word or -1, 0, 0). */
+	public static final String QUAD_INFO2 = "iris_QuadInfo2";
+	/** The draw's own vertex buffer as 32-bit words (a uniform texel buffer view of it). */
+	public static final String VERTEX_DATA = "iris_VertexData";
+
+	private static final Set<String> DERIVABLE = Set.of("at_tangent", "mc_midTexCoord");
+
+	/** {@code names}: the vertex inputs that became derived globals (empty: the sources are unchanged). */
+	public record Derived(Map<PatchShaderType, String> sources, Set<String> names) {
+	}
+
+	/**
+	 * Iris fills {@code at_tangent} and {@code mc_midTexCoord} on the CPU for every quad (and triangle) of its extended
+	 * vertex formats ({@code MixinBufferBuilder.fillExtendedData}, using FabricMC's {@code NormalHelper}). On Polydium the
+	 * vanilla vertex buffers keep vanilla's layout, so the same values are computed here in the vertex shader instead:
+	 * the inputs become globals, filled at the start of {@code main} from the draw's own vertices (the quad or triangle
+	 * the vertex belongs to), read through {@link #VERTEX_DATA}. With mode 0 (a vertex format or mode Iris doesn't
+	 * extend) they read GL's default (0, 0, 0, 1), as before.
+	 */
+	public static synchronized Derived deriveQuadAttributes(Map<PatchShaderType, String> sources) {
+		String vsh = sources.get(PatchShaderType.VERTEX);
+		if (vsh == null) return new Derived(sources, Set.of());
+		TranslationUnit tree = parser.parseSeparateTranslationUnit(vsh);
+		var root = tree.getRoot();
+		Map<String, String> found = new LinkedHashMap<>();
+		root.indexBuildSession(() -> {
+			for (var external : List.copyOf(tree.getChildren())) {
+				if (!(external instanceof DeclarationExternalDeclaration d) || !(d.getDeclaration() instanceof TypeAndInitDeclaration v)) continue;
+				var q = v.getType().getTypeQualifier();
+				if (!Glsl.hasStorage(q, StorageType.IN) && !Glsl.hasStorage(q, StorageType.ATTRIBUTE)) continue;
+				if (v.getMembers().size() != 1) continue;
+				var member = v.getMembers().get(0);
+				String name = member.getName().getName();
+				if (!DERIVABLE.contains(name) || root.identifierIndex.get(name).size() <= 1) continue;
+				if (member.getArraySpecifier() != null || !(v.getType().getTypeSpecifier() instanceof BuiltinNumericTypeSpecifier)) continue;
+				found.put(name, ASTPrinter.print(PrintType.COMPACT, v.getType().getTypeSpecifier()).trim());
+				d.detachAndDelete();
+			}
+		});
+		if (found.isEmpty()) return new Derived(sources, Set.of());
+		StringBuilder init = new StringBuilder("iris_deriveQuad();");
+		StringBuilder globals = new StringBuilder();
+		for (var e : found.entrySet()) {
+			globals.append(e.getValue()).append(' ').append(e.getKey()).append(";\n");
+			init.append(e.getKey()).append(" = ").append(e.getValue()).append('(')
+				.append(e.getKey().equals("at_tangent") ? "iris_quadTangent" : "iris_quadMidTex").append(");");
+		}
+		root.indexBuildSession(() -> {
+			List<String> nodes = new ArrayList<>();
+			for (String n : QUAD_HELPERS.split("@@")) if (!n.isBlank()) nodes.add(n);
+			for (String g : globals.toString().split(";")) if (!g.isBlank()) nodes.add(g.strip() + ";");
+			tree.parseAndInjectNodes(parser, ASTInjectionPoint.BEFORE_FUNCTIONS, nodes.toArray(String[]::new));
+			tree.prependMainFunctionBody(parser, init.toString());
+		});
+		Map<PatchShaderType, String> out = new EnumMap<>(PatchShaderType.class);
+		out.putAll(sources);
+		out.put(PatchShaderType.VERTEX, ASTPrinter.print(PrintType.INDENTED, tree));
+		return new Derived(out, found.keySet());
+	}
+
+	/**
+	 * GLSL port of Iris MixinBufferBuilder.fillExtendedData and FabricMC NormalHelper (Apache-2.0):
+	 * quads: face normal from the diagonals, tangent from vertices 0-1-2 against it; triangles: per-vertex normal,
+	 * positions projected onto its plane (computeTangentSmooth); both: the mean UV, and the tangent stored like
+	 * NormI8.pack (truncated to 1/127 steps, read back as normalized bytes).
+	 */
+	private static final String QUAD_HELPERS = """
+		uniform usamplerBuffer iris_VertexData;
+		@@
+		uniform ivec4 iris_QuadInfo;
+		@@
+		uniform ivec4 iris_QuadInfo2;
+		@@
+		vec4 iris_quadTangent = vec4(0.0, 0.0, 0.0, 1.0);
+		@@
+		vec4 iris_quadMidTex = vec4(0.0, 0.0, 0.0, 1.0);
+		@@
+		vec3 iris_quadPos(int v) {
+			int w = v * iris_QuadInfo.z + iris_QuadInfo.w;
+			return uintBitsToFloat(uvec3(texelFetch(iris_VertexData, w).r, texelFetch(iris_VertexData, w + 1).r, texelFetch(iris_VertexData, w + 2).r));
+		}
+		@@
+		vec2 iris_quadUv(int v) {
+			int w = v * iris_QuadInfo.z + iris_QuadInfo2.x;
+			return uintBitsToFloat(uvec2(texelFetch(iris_VertexData, w).r, texelFetch(iris_VertexData, w + 1).r));
+		}
+		@@
+		vec3 iris_quadNormal(int v) {
+			if (iris_QuadInfo2.y < 0) return vec3(0.0, 1.0, 0.0);
+			uint p = texelFetch(iris_VertexData, v * iris_QuadInfo.z + iris_QuadInfo2.y).r;
+			return max(vec3(float(int(p << 24u) >> 24), float(int(p << 16u) >> 24), float(int(p << 8u) >> 24)) / 127.0, vec3(-1.0));
+		}
+		@@
+		float iris_quadRsqrt(float v) {
+			return v == 0.0 ? 1.0 : inversesqrt(v);
+		}
+		@@
+		vec4 iris_quadTangentFor(vec3 n, vec3 p0, vec3 p1, vec3 p2, vec2 t0, vec2 t1, vec2 t2) {
+			vec3 e1 = p1 - p0;
+			vec3 e2 = p2 - p0;
+			vec2 d1 = t1 - t0;
+			vec2 d2 = t2 - t0;
+			float fdenom = d1.x * d2.y - d2.x * d1.y;
+			float f = fdenom == 0.0 ? 1.0 : 1.0 / fdenom;
+			vec3 t = f * (d2.y * e1 - d1.y * e2);
+			t *= iris_quadRsqrt(dot(t, t));
+			vec3 b = f * (-d2.x * e1 + d1.x * e2);
+			b *= iris_quadRsqrt(dot(b, b));
+			vec3 pb = vec3(t.y * n.z - t.z * n.y, t.z * n.x - t.x * n.z, t.x * n.y - t.y * n.x);
+			return vec4(t, dot(b, pb) < 0.0 ? -1.0 : 1.0);
+		}
+		@@
+		void iris_deriveQuad() {
+			int mode = iris_QuadInfo.x;
+			if (mode == 0) return;
+			int base = iris_QuadInfo.y + ((gl_VertexID - iris_QuadInfo.y) / mode) * mode;
+			vec2 mid = vec2(0.0);
+			for (int i = 0; i < mode; i++) mid += iris_quadUv(base + i);
+			mid /= float(mode);
+			vec3 p0 = iris_quadPos(base);
+			vec3 p1 = iris_quadPos(base + 1);
+			vec3 p2 = iris_quadPos(base + 2);
+			vec4 t;
+			if (mode == 4) {
+				vec3 p3 = iris_quadPos(base + 3);
+				vec3 n = normalize(cross(p2 - p0, p3 - p1));
+				t = iris_quadTangentFor(n, p0, p1, p2, iris_quadUv(base), iris_quadUv(base + 1), iris_quadUv(base + 2));
+			} else {
+				vec3 n = iris_quadNormal(gl_VertexID);
+				p0 -= dot(p0, n) * n;
+				p1 -= dot(p1, n) * n;
+				p2 -= dot(p2, n) * n;
+				t = iris_quadTangentFor(n, p0, p1, p2, iris_quadUv(base), iris_quadUv(base + 1), iris_quadUv(base + 2));
+			}
+			vec4 q = trunc(t * 127.0) / 127.0;
+			iris_quadTangent = mix(q, vec4(0.0), isnan(q));
+			iris_quadMidTex = vec4(mid, 0.0, 1.0);
+		}
+		""";
+
 	private static final java.util.regex.Pattern FRAG_DEPTH_WRITE = java.util.regex.Pattern.compile("gl_FragDepth[ \\t\\n]*(=[^=]|[-+*/]=)");
 
 	/**

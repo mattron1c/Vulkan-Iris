@@ -81,6 +81,11 @@ public abstract class MixinVulkanRenderPassPort {
 		VanillaHook.close(vulkaniris$self(), commandBuffer(), pipeline, hasDepth);
 	}
 
+	@Inject(method = "setVertexBuffer", at = @At("HEAD"), remap = false)
+	private void vulkaniris$vertexBuffer(int slot, com.mojang.blaze3d.buffers.GpuBuffer buffer, CallbackInfo ci) {
+		VanillaHook.vertexBuffer(vulkaniris$self(), slot, buffer);
+	}
+
 	@Inject(method = "enableScissor", at = @At("TAIL"), remap = false)
 	private void vulkaniris$scissor(int x, int y, int w, int h, CallbackInfo ci) {
 		VanillaHook.scissor(vulkaniris$self(), x, y, w, h);

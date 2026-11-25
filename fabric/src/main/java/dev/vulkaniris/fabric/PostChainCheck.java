@@ -378,6 +378,8 @@ public final class PostChainCheck {
 			line("vanilla: " + (VanillaHook.redirectedPasses() - vanillaPassesAtStart) + " Polydium world passes redirected; draws per pack program "
 				+ chain.vanillaDraws());
 			line("  hand passes (pre-hand depth copy + solid hand): " + handPasses);
+			line("  derived at_tangent / mc_midTexCoord: " + chain.derivedDraws() + " draws computed them per quad in the vertex shader");
+			chain.derivedSkipped().forEach(x -> line("    not derived (GL default): " + x));
 			if (chain.hasShadowPass()) {
 				line("shadow: " + shadowPasses + " shadow passes (" + chain.shadowResolution() + "x" + chain.shadowResolution() + "), "
 					+ shadowTerrainPasses + " shadow terrain passes drawn with the pack's shadow programs; culling: " + shadowCulling);

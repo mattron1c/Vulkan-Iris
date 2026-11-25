@@ -25,6 +25,7 @@
     "MixinGameRendererHandPort",
     "MixinItemInHandRendererPort",
     "MixinItemPort",
+    "MixinImmediateDrawRingTexelPort",
     "MixinLevelRendererHandPort",
     "MixinLevelRendererVulkan",
     "MixinLocalPlayerPort",
@@ -37,6 +38,7 @@
     "MixinSodiumWorldRendererShadowPort",
     "MixinVulkanCommandEncoderPort",
     "MixinVulkanDeferralPort",
+    "MixinVertexFormatTexelPort",
     "MixinVulkanRenderPassPort"
   ],
   "injectors": {

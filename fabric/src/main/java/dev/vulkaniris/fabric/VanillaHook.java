@@ -125,6 +125,21 @@ public final class VanillaHook {
 
 	/** Diagnostics: draws per vanilla pipeline while the pack is active ("[other target]": a pass not on the main target). */
 	private static final Map<String, Long> seen = new java.util.TreeMap<>();
+	/** The vertex buffer each pass has on binding 0 (VulkanRenderPass.setVertexBuffer binds it right away, keeps no field). */
+	private static final Map<Object, com.mojang.blaze3d.buffers.GpuBuffer> vertexBuffers = new java.util.WeakHashMap<>();
+
+	/** VulkanRenderPass.setVertexBuffer HEAD. */
+	public static void vertexBuffer(VulkanRenderPass pass, int slot, com.mojang.blaze3d.buffers.GpuBuffer buffer) {
+		if (slot == 0 && sink != null) vertexBuffers.put(pass, buffer);
+	}
+
+	private static PostChain.VertexSource vertexSource(VulkanRenderPass pass) {
+		var b = vertexBuffers.get(pass);
+		if (!(b instanceof VulkanGpuBuffer vb)) return null;
+		// Polydium's transient buffers are created with uniform-texel-buffer usage; its direct buffers only when Blaze3D asks
+		boolean texel = b.getClass().getName().endsWith("TransientGpuBuffer") || (b.usage() & com.mojang.blaze3d.buffers.GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER) != 0;
+		return new PostChain.VertexSource(b, vb.vkBuffer(), b.size(), texel);
+	}
 
 	static Map<String, Long> takeSeen() {
 		Map<String, Long> m = new java.util.TreeMap<>(seen);
@@ -213,7 +228,7 @@ public final class VanillaHook {
 				PolydiumAccess.polydiumBarrier(cmd);
 				cur.suspended = true;
 			}
-			s.draw(cmd, key, info, new State(uniforms, textures, outW, outH, cur.scissor), hasDepth, indexed, a, b, c, d, e);
+			s.draw(cmd, key, info, new State(uniforms, textures, outW, outH, cur.scissor, vertexSource(pass)), hasDepth, indexed, a, b, c, d, e);
 			return HANDLED;
 		} catch (Throwable t) {
 			s.failed(t);
@@ -280,7 +295,7 @@ public final class VanillaHook {
 
 	/** The vanilla pass's bound uniform blocks and textures, as PostChain reads them. */
 	private record State(Map<String, GpuBufferSlice> uniforms, Map<String, VulkanRenderPass.TextureViewAndSampler> textures, int viewportWidth,
-						 int viewportHeight, int[] scissor) implements PostChain.PassState {
+						 int viewportHeight, int[] scissor, PostChain.VertexSource vertexBuffer) implements PostChain.PassState {
 		@Override
 		public long[] block(String name) {
 			GpuBufferSlice slice = uniforms.get(name);

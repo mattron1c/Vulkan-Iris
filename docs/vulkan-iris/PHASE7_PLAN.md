@@ -34,6 +34,7 @@ renders the shadow maps. Once that works, packs render as they do on Iris and pe
 5. **7e: correctness sweep** over all 10 packs:
    - Compare against Iris on GL with the same world, seed, camera and time.
    - Check the Iris-only features: hand depth, `depthtex1`/`2`, blend overrides, mipmapped buffers, viewport scale.
+   - *Done:* `at_tangent` / `mc_midTexCoord` derived per quad in the vertex shader (Noble's black glass), see [PHASE7_STATUS.md](PHASE7_STATUS.md#slice-7e--derived-at_tangent--mc_midtexcoord).
 
 ## Performance — how it will be measured (no claim until measured)
 Being "faster than Iris" can only be shown once both render the same frame, after 7b–7d. Method:

@@ -5,6 +5,7 @@ import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.platform.DepthTestFunction;
 import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import net.irisshaders.iris.gl.state.ShaderAttributeInputs;
@@ -922,12 +923,31 @@ final class PostChain implements AutoCloseable {
 		/** The VkSampler vanilla bound with {@code name}'s texture. */
 		long sampler(String name);
 
+		/** The draw's vertex buffer (binding 0), or null if none was seen. */
+		default VertexSource vertexBuffer() {
+			return null;
+		}
+
 		/** Viewport size and the current scissor rectangle {x, y, w, h}. */
 		int viewportWidth();
 
 		int viewportHeight();
 
 		int[] scissor();
+	}
+
+	/**
+	 * A vanilla vertex buffer: {@code key} identifies the buffer object (handles can be reused after Polydium frees a
+	 * buffer), {@code texelReadable}: it was created with uniform-texel-buffer usage, so a buffer view can read it.
+	 */
+	record VertexSource(Object key, long vkBuffer, long size, boolean texelReadable) {
+		String describe() {
+			return key.getClass().getName() + (key instanceof com.mojang.blaze3d.buffers.GpuBuffer g ? " usage " + g.usage() : "");
+		}
+	}
+
+	/** The draw's own vertex buffer as 32-bit words (VulkanGlslTranslator.deriveQuadAttributes). */
+	private record DrawVertices() implements Source {
 	}
 
 	/** A vanilla uniform block ({@code iris_<name>} in the patched program) that the render pass set. */
@@ -968,6 +988,9 @@ final class PostChain implements AutoCloseable {
 		ShaderKey key;
 		/** A shadow-pass key (Iris IrisPipelines' shadow map): draws into shadowcolorN and shadowtex0. */
 		boolean shadow;
+		/** Vertex inputs computed per quad in the shader (at_tangent, mc_midTexCoord), and their push constants. */
+		Set<String> derived = Set.of();
+		int pushSize, quadInfoOffset = -1, quadInfo2Offset = -1;
 		String name;
 		ShaderResourceLayout layout;
 		List<Bound> bounds = new ArrayList<>();
@@ -1149,7 +1172,17 @@ final class PostChain implements AutoCloseable {
 			key.isText(), key == ShaderKey.IE_COMPAT);
 		Map<PatchShaderType, String> gl = TransformPatcher.patchVanilla(v.name, src.getVertexSource().orElseThrow(), src.getGeometrySource().orElse(null),
 			null, null, src.getFragmentSource().orElseThrow(), alpha, isLines, key == ShaderKey.CLOUDS, true, inputs, directives.getTextureMap());
-		var vk = VulkanGlslTranslator.translate(gl, vanillaWriter::provides);
+		// Iris fills at_tangent / mc_midTexCoord per quad on the CPU; here the vertex shader computes them from the quad
+		var derived = VulkanGlslTranslator.deriveQuadAttributes(gl);
+		v.derived = derived.names();
+		var vk = v.derived.isEmpty() ? VulkanGlslTranslator.translate(derived.sources(), vanillaWriter::provides)
+			: VulkanGlslTranslator.translate(derived.sources(), vanillaWriter::provides, List.of(VulkanGlslTranslator.QUAD_INFO, VulkanGlslTranslator.QUAD_INFO2));
+		if (!v.derived.isEmpty()) {
+			v.pushSize = vk.pushConstantSize();
+			var pc = vk.pushConstants();
+			v.quadInfoOffset = pc.containsKey(VulkanGlslTranslator.QUAD_INFO) ? pc.get(VulkanGlslTranslator.QUAD_INFO).offset() : -1;
+			v.quadInfo2Offset = pc.containsKey(VulkanGlslTranslator.QUAD_INFO2) ? pc.get(VulkanGlslTranslator.QUAD_INFO2).offset() : -1;
+		}
 		v.layout = vk.layout();
 		v.attributes = vk.attributes();
 		for (String u : vanillaWriter.unresolved(v.layout)) notes.add(v.name + ": uniform " + u + " has no Vulkan value yet (zero)");
@@ -1357,7 +1390,7 @@ final class PostChain implements AutoCloseable {
 		boolean test = depth && p.getDepthTestFunction() != DepthTestFunction.NO_DEPTH_TEST;
 		int mask = (p.isWriteColor() ? VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT : 0) | (p.isWriteAlpha() ? VK_COLOR_COMPONENT_A_BIT : 0);
 		var raster = new GraphicsProgram.Raster(depth ? (v.shadow ? VK_FORMAT_D32_SFLOAT : mainDepthFormat) : 0, test, depth && p.isWriteDepth(), depthCompare(p.getDepthTestFunction()),
-			p.isCull() ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE, 0, mask, p.getDepthBiasConstant(), p.getDepthBiasScaleFactor());
+			p.isCull() ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE, v.pushSize, mask, p.getDepthBiasConstant(), p.getDepthBiasScaleFactor());
 		arr[i] = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec(v.name + " / " + p.getLocation(), v.stages, v.spirv, v.bindings, attributes,
 			format.getVertexSize(), topology(p.getVertexFormatMode()), colorFormats, blends, raster));
 		return arr[i];
@@ -1426,8 +1459,17 @@ final class PostChain implements AutoCloseable {
 			CapturedRenderingState.INSTANCE.setCurrentAlphaTest(v.alphaTest);
 		}
 		long ds = ring.allocate(program.setLayout());
+		int[] quad = v.derived.isEmpty() ? null : quadInfo(v, pipeline, st, indexed, c, d);
 		r.write(ds, v.bounds, v.layout, v.ubo, v.stride, slot, vanillaWriter, fill, 0);
 		program.bind(cmd, ds);
+		if (quad != null) {
+			push.clear();
+			if (v.quadInfoOffset >= 0) for (int i = 0; i < 4; i++) push.putInt(v.quadInfoOffset + 4 * i, quad[i]);
+			if (v.quadInfo2Offset >= 0) for (int i = 0; i < 4; i++) push.putInt(v.quadInfo2Offset + 4 * i, quad[4 + i]);
+			push.limit(v.pushSize);
+			program.pushConstants(cmd, push);
+			push.clear();
+		}
 		try (MemoryStack s = MemoryStack.stackPush()) {
 			if (v.usesConstants.get(pipeline)) vkCmdBindVertexBuffers(cmd, GraphicsProgram.CONSTANT_BINDING, s.longs(constantAttributes.buffer()), s.longs(0));
 			VkViewport.Buffer vp = VkViewport.calloc(1, s);
@@ -1444,6 +1486,87 @@ final class PostChain implements AutoCloseable {
 		else vkCmdDraw(cmd, a, b, c, d);
 		v.draws++;
 		passState = null;
+	}
+
+	// ------------------------------------------------------------------ extended vertex attributes (Iris fillExtendedData)
+
+	private long drawVertexView;
+	private GpuBuffer dummyTexel;
+	private final Map<Object, Long> vertexViews = new IdentityHashMap<>();
+	private long derivedDraws;
+	private final Set<String> derivedSkipped = new TreeSet<>();
+	private long maxTexelElements = -1;
+
+	/**
+	 * Push constants for a program with derived attributes: (mode, first vertex, stride, position word) and (UV0 word,
+	 * normal word or -1, 0, 0), and the texel view of the draw's vertex buffer. Iris extends only NEW_ENTITY, BLOCK and
+	 * POSITION_COLOR_TEX_LIGHTMAP, and fills only QUADS and TRIANGLES; other draws get mode 0 (GL's default values).
+	 */
+	private int[] quadInfo(Vanilla v, RenderPipeline p, PassState st, boolean indexed, int c, int d) {
+		int[] info = new int[8];
+		if (dummyTexel == null) {
+			dummyTexel = buffer("derived attributes: no vertex data", 16, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT);
+			try (MemoryStack s = MemoryStack.stackPush()) {
+				VkPhysicalDeviceProperties props = VkPhysicalDeviceProperties.malloc(s);
+				vkGetPhysicalDeviceProperties(ctx.physicalDevice(), props);
+				maxTexelElements = props.limits().maxTexelBufferElements() & 0xFFFFFFFFL;
+			}
+		}
+		drawVertexView = texelView(dummyTexel.buffer(), 0, 16, VK_FORMAT_R32_UINT);
+		VertexFormat f = p.getVertexFormat();
+		int mode = switch (p.getVertexFormatMode()) {
+			case QUADS -> 4;
+			case TRIANGLES -> 3;
+			default -> 0;
+		};
+		String why = null;
+		if (mode == 0) why = "vertex mode " + p.getVertexFormatMode() + " (Iris fills quads and triangles only)";
+		else if (f != DefaultVertexFormat.NEW_ENTITY && f != DefaultVertexFormat.BLOCK && f != DefaultVertexFormat.POSITION_COLOR_TEX_LIGHTMAP) {
+			why = "vertex format not extended by Iris";
+		}
+		VertexSource vb = st.vertexBuffer();
+		if (why == null && vb == null) why = "no vertex buffer seen on the pass";
+		if (why == null && !vb.texelReadable()) why = "the vertex buffer has no uniform-texel-buffer usage (" + vb.describe() + ")";
+		if (why == null && (f.getVertexSize() % 4 != 0 || f.getOffset(VertexFormatElement.POSITION) % 4 != 0 || f.getOffset(VertexFormatElement.UV0) % 4 != 0
+			|| f.contains(VertexFormatElement.NORMAL) && f.getOffset(VertexFormatElement.NORMAL) % 4 != 0)) why = "elements not 4-byte aligned";
+		if (why == null && vb.size() / 4 > maxTexelElements) why = "vertex buffer larger than maxTexelBufferElements";
+		if (why != null) {
+			derivedSkipped.add(p.getLocation() + ": " + why);
+			return info;
+		}
+		Long view = vertexViews.get(vb.key());
+		if (view == null) {
+			if (vertexViews.size() >= 64) {
+				// buffers come and go (Polydium's transient chunks stay): drop the views once frames using them are done
+				List<Long> old = new ArrayList<>(vertexViews.values());
+				destroyer.defer("vertex texel views", () -> old.forEach(x -> vkDestroyBufferView(ctx.device(), x, null)));
+				vertexViews.clear();
+			}
+			try (MemoryStack s = MemoryStack.stackPush()) {
+				LongBuffer lp = s.mallocLong(1);
+				VkCheck.check(vkCreateBufferView(ctx.device(), VkBufferViewCreateInfo.calloc(s).sType$Default().buffer(vb.vkBuffer()).format(VK_FORMAT_R32_UINT)
+					.offset(0).range(vb.size() - vb.size() % 4), null, lp), "vkCreateBufferView(vertex data)");
+				view = lp.get(0);
+			}
+			vertexViews.put(vb.key(), view);
+		}
+		drawVertexView = view;
+		info[0] = mode;
+		info[1] = indexed ? d : c;
+		info[2] = f.getVertexSize() / 4;
+		info[3] = f.getOffset(VertexFormatElement.POSITION) / 4;
+		info[4] = f.getOffset(VertexFormatElement.UV0) / 4;
+		info[5] = f.contains(VertexFormatElement.NORMAL) ? f.getOffset(VertexFormatElement.NORMAL) / 4 : -1;
+		derivedDraws++;
+		return info;
+	}
+
+	long derivedDraws() {
+		return derivedDraws;
+	}
+
+	Set<String> derivedSkipped() {
+		return derivedSkipped;
 	}
 
 	/** Ends Vulkan Iris's rendering scope for vanilla draws, if one is open (before Polydium resumes its own pass). */
@@ -1550,6 +1673,7 @@ final class PostChain implements AutoCloseable {
 			case "Sampler2" -> in.hasLight() ? new PassSampler("Sampler2") : white();
 			// vanilla CloudRenderer: setUniform("CloudFaces", slice), UniformType.TEXEL_BUFFER, TextureFormat.RED8I
 			case "CloudFaces" -> new PassTexel("CloudFaces", VK_FORMAT_R8_SINT);
+			case VulkanGlslTranslator.VERTEX_DATA -> new DrawVertices();
 			default -> null;
 		};
 	}
@@ -2606,6 +2730,8 @@ final class PostChain implements AutoCloseable {
 					}
 					case PassTexel pt -> {
 					}
+					case DrawVertices dv -> {
+					}
 					case PassBlock pb -> {
 					}
 					// vanilla's own textures (Polydium keeps them in GENERAL, written in earlier passes behind its full barriers)
@@ -2663,6 +2789,7 @@ final class PostChain implements AutoCloseable {
 							if (blk == null) throw new IllegalStateException("the vanilla pass set no " + pb.name() + " uniform block");
 							w.buffer(b.binding(), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, blk[0], blk[1], blk[2]);
 						}
+						case DrawVertices dv -> w.texelBuffer(b.binding(), drawVertexView);
 						case PassTexel pt -> {
 							long[] blk = passState.block(pt.name());
 							if (blk == null) throw new IllegalStateException("the vanilla pass set no " + pt.name() + " texel buffer");
