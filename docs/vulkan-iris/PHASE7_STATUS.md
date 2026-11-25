@@ -258,8 +258,13 @@ nothing occludes and the trunk and ground under the tree are lit. With the shado
     `watershadow`, else `shadowtex0`.
   - `sampler2DShadow` gets a depth-compare sampler; the filter follows `shadowHardwareFiltering` / `shadowNearest`.
   - Depth is sampled through a view that reads (depth, depth, depth, 1), Iris's GL texture swizzle.
-- **shadowcomp.** The packs' `shadowcomp` compute programs (BSL, Complementary Reimagined / Unbound, Bliss, Solas)
-  run after the shadow pass, dispatched against the shadow map's size as in Iris's `ShadowCompositeRenderer`.
+- **shadowcomp.** The packs' `shadowcomp` compute programs run after the shadow pass. *(Corrected in
+  [7d follow-ups](#7d-follow-ups-shadowcomp-shadowcsh-hardware-samplers):
+  - Iris dispatches them against the main render target's size, not the shadow map's.
+  - With default options only Solas runs one. BSL, Complementary Reimagined / Unbound and Bliss have shadowcomp
+    programs, but their `shaders.properties` turn them off (`program.world0/shadowcomp.enabled`: colored lighting
+    off or `false`).
+  - All of them set fixed `workGroups`, so no output depended on the dispatch size.)*
 - **Polydium's occlusion culler.** It turns itself off when Iris's API reports a pack in use, which is what happens
   with Iris on GL. Iris's GL pipeline never runs on Vulkan, so the fork's `IrisApiV0Impl.isShaderPackInUse` now also
   reports a Vulkan pack (`vulkanPackInUse`). Without that, the camera-based culler would have filtered the shadow view's sections too.
@@ -267,10 +272,10 @@ nothing occludes and the trunk and ground under the tree are lit. With the shado
 ## Limits (all reported in the notes)
 - ~~only terrain is drawn into the shadow map~~: entities and block entities followed, see
   [7d entity shadows](#7d-entity-shadows) below
-- fragment `shadowcomp` programs and `shadow.csh` are reported, not run (none of the 10 packs has them)
-- shadow mipmaps (`shadowtex0Mipmap` etc.), `shadowtex0HW` / `shadowtex1HW` (separate hardware samplers) and
-  `shadowcolorimgN` storage images are not done
-- shadowcolor ping-pong (flipping between shadowcomp passes) is not implemented
+- ~~fragment `shadowcomp` programs, `shadow.csh`, `shadowtex0HW` / `shadowtex1HW`, `shadowcolorimgN`, shadowcolor
+  flipping~~: done, see [7d follow-ups](#7d-follow-ups-shadowcomp-shadowcsh-hardware-samplers)
+- shadow mipmaps (`shadowtex0Mipmap`, `shadowcolor0Mipmap` etc.) are not done: reported in the notes. None of the 10
+  packs turns them on (MakeUp declares them all `false`)
 - a `sampler2D` on a shadow map with `shadowHardwareFiltering` set is undefined on GL; here the GLSL type decides
   (no compare), and the notes say so (Complementary, Bliss)
 - the shadow pass is redrawn every frame, as Iris does
@@ -383,3 +388,58 @@ Draws that derived the attributes, per pack (`prodPhase7`, Phase 7 report line "
 - Iris also overwrites a quad's normal with the face normal it computes. Here `iris_Normal` stays vanilla's per-vertex
   normal, which for entity quads is normally the same face normal.
 - No A/B performance numbers yet: per vertex, it is 4 position fetches, 4 UV fetches and a few dozen ALU ops.
+
+# 7d follow-ups: shadowcomp, shadow.csh, hardware samplers
+
+**Result:** fragment `shadowcomp` programs, shadowcolor flipping, `shadow.csh`, `shadowcolorimgN` and the separate
+hardware samplers (`shadowtex0HW` / `shadowtex1HW`) now run as in Iris. None of the 10 packs uses them, so they are
+tested with a self-test pack written for this repository, `fabric/testpacks/vulkaniris-selftest-shadowcomp` (LGPL-3.0,
+our own code). `prodPhase7` copies it into `run-prod/shaderpacks` and runs it like the other packs.
+
+The test pack's final pass checks 7 values and draws green only when all of them are right; otherwise it draws a bit
+mask of the failed checks, which the report prints:
+
+| check | what writes it | proves |
+|---|---|---|
+| shadowcolor0 (0,0) = (0.2, 0.7, 0) | `shadowcomp2.csh`, a compute-only index, through `shadowcolorimg0` | storage images, and which texture a flipped snapshot binds |
+| shadowcolor0 (1,0) = (0.9, 0.1, 0.4) | `shadow.csh` at frame start, kept by `shadowcomp`'s `discard` | `shadow.csh` runs, before the shadowcomp passes |
+| shadowcolor0 (2,0) = (0.2, 0, 0) | `shadowcomp.fsh` | fragment shadowcomp writes the texture it doesn't read |
+| shadowcolor1 (2,0) = (0.5, 1, 0) | `shadowcomp1.fsh`, from shadowcolor0 after its flip | a later pass reads the flipped texture |
+| `shadowtex0HW`, ref -1 → 1 and ref 2 → 0 | the shadow map | depth compare on the HW sampler |
+| `textureSize(shadowtex0)` = 256 | the shadow map | the plain name is bound (no compare) |
+
+Result: `self-test pack: all checks passed`, with `prodPhase7` at 11 / 11 (the 10 packs and the self-test pack) and
+`prodPhase6` still at 10 / 10 (Phase 6 has no shadow pass, so it skips the self-test pack). The test also caught a bug while it was being written. The final flip
+state was computed only when the shadow terrain programs already existed, which they didn't yet. Every later program
+then read the unflipped textures, and the test reported mask 13 (three checks failed).
+
+### How it works (ports of Iris, LGPL-3.0, credit: the Iris team)
+- **Flips.** `ShadowCompositeRenderer` flips shadowcolors only while it is built, in this order: `shadowcomp_pre`, then
+  each fragment program's draw buffers (unless flipped `false`), then its explicit flips. After that the state never
+  changes.
+  - `PostChain.shadowCompositeFlips` replays the same walk before any program is built. Every other program (gbuffers,
+    shadow, deferred, composite, final) binds the final state (`ShadowRenderTargets.getColorTextureId`).
+  - Each shadowcomp index binds its own snapshot.
+- **Alt textures.** A shadowcolor gets an "alt" twin when a shadowcomp pass writes it. It is cleared like the main one,
+  fully when created and per frame when the pack's clear flag is set (`ClearPassCreator.createShadowClearPasses`).
+  The shadow pass always writes "main".
+- **Per index:** first the computes, dispatched against the **main render target's size**, as Iris's `renderAll`
+  passes `main.width / main.height`. Then a barrier, then the fragment program over the whole shadow map:
+  - unknown draw buffers become {0, 1}
+  - only the program-wide blend override applies
+- **Samplers.** As in Iris, shadowcomp programs get no `colortex` or `depthtex` samplers, and `shadow.csh` gets no
+  `depthtex`. Here they read a zero stand-in, and the notes say so.
+- **`shadow.csh`.** It runs at frame start, after the shadow depth clear and before the shadowcolor clears, dispatched
+  against the shadow map's size (`IrisRenderingPipeline.beginLevelRendering`).
+- **`shadowcolorimgN`.** It is the shadowcolor the stage reads, as a storage image. Shadowcolors are created with
+  storage usage when the format allows it; a pack that binds one whose format doesn't gets a clear error.
+- **`SEPARATE_HARDWARE_SAMPLERS`.** With this feature flag, `shadowtex0` / `shadowtex1` have no compare and
+  `shadowtex0HW` / `shadowtex1HW` have it, but only for a map with `shadowHardwareFiltering`. Without the flag, the
+  HW names keep the "not bound" stand-in and a note.
+- **Test runs.** Self-test runs are never "up to date" in Gradle: the run task had no inputs for the packs, so a
+  changed test pack was silently not run.
+
+### Limits
+- shadow mipmaps are not done (see above)
+- fragment shadowcomp's viewport scale is ignored and reported, as for the other composite passes
+- `shadow.csh` gets the colortex samplers, but not Iris's level samplers (`tex`, `lightmap`)

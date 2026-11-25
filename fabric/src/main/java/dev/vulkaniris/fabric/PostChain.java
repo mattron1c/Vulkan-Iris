@@ -242,6 +242,8 @@ final class PostChain implements AutoCloseable {
 		long stride;
 		final long[] slotSubmit = new long[SLOTS];
 		boolean usesSsbo;
+		/** A shadowcomp pass: the shadowcolors it reads from "alt" (Iris pass.stageReadsFromAlt); it writes the other one. */
+		Set<Integer> shadowReadsAlt;
 	}
 
 	private record Stage(ProgramArrayId array, TextureStage stage, String preFlips) {
@@ -275,7 +277,21 @@ final class PostChain implements AutoCloseable {
 	/** shadowtex0 (rendered into) and shadowtex1 (its copy before translucent shadow terrain); Iris ShadowRenderTargets. */
 	private GpuImage shadowDepth, shadowDepthNoTranslucent;
 	private final GpuImage[] shadowColor = new GpuImage[PackShadowDirectives.MAX_SHADOW_COLOR_BUFFERS_IRIS];
-	private List<Compute> shadowComposite = List.of();
+	/** Iris ShadowCompositeRenderer passes, in order: an index's computes, then its fragment program (if any). */
+	private final List<Pass> shadowComposite = new ArrayList<>();
+	/** Iris shadowComputes (shadow.csh, shadow_a.csh ...): dispatched at frame start, after the shadow depth clear. */
+	private List<Compute> shadowComputes = List.of();
+	/** Iris ShadowRenderTargets' "alt" textures, created for the shadowcolors a shadowcomp pass writes. */
+	private final GpuImage[] shadowColorAlt = new GpuImage[PackShadowDirectives.MAX_SHADOW_COLOR_BUFFERS_IRIS];
+	/**
+	 * Iris flips shadowcolors only in ShadowCompositeRenderer's constructor, so after it the flip state is fixed: every
+	 * other program reads these shadowcolors from "alt" (ShadowRenderTargets.getColorTextureId).
+	 */
+	private Set<Integer> shadowFlipFinal = Set.of();
+	/** While a shadowcomp program is built: the flip snapshot it reads with (null: the final state). */
+	private Set<Integer> shadowReadAlt;
+	/** While a shadowcomp / shadow.csh program is built: its name for notes (Iris binds fewer samplers there). */
+	private String resolvingShadowStage;
 	/** While true, the terrain uniforms read the shadow view (Iris sets the shadow matrices into ChunkRenderMatrices). */
 	private boolean shadowing;
 	private final Matrix4f shadowModelView = new Matrix4f(), shadowProjection = new Matrix4f();
@@ -382,6 +398,8 @@ final class PostChain implements AutoCloseable {
 		used.add(0);
 		Set<Integer> flippedOnce = new HashSet<>();
 		// Iris IrisRenderingPipeline: setup programs run once, before everything else
+		// shadowPass, not hasShadowPass(): the shadow terrain programs are built later, and they read the final flip state too
+		if (withGbuffers && shadowPass) shadowFlipFinal = shadowCompositeFlips(null);
 		this.setup = buildComputes(compiler, set.getSetup(), TextureStage.SETUP, used, Set.of());
 		if (withGbuffers) {
 			buildTerrain(compiler, used);
@@ -479,10 +497,12 @@ final class PostChain implements AutoCloseable {
 		p.name = src.getName();
 		p.isFinal = isFinal;
 		var d = src.getDirectives();
+		boolean shadowcomp = resolvingShadowStage != null;
 		if (!isFinal) {
-			p.drawBuffers = d.getDrawBuffers();
+			// Iris ShadowCompositeRenderer: unknown draw buffers are {0, 1}
+			p.drawBuffers = shadowcomp && d.hasUnknownDrawBuffers() ? new int[]{0, 1} : d.getDrawBuffers();
 			p.explicitFlips = d.getExplicitFlips();
-			for (int b : p.drawBuffers) used.add(b);
+			if (!shadowcomp) for (int b : p.drawBuffers) used.add(b);
 		}
 		if (d.getViewportScale() != null && d.getViewportScale().scale() != 1.0f) notes.add(p.name + ": viewport scale ignored (not implemented yet)");
 		if (!d.getMipmappedBuffers().isEmpty()) notes.add(p.name + ": mipmapped buffers sampled without mipmaps (not implemented yet)");
@@ -532,14 +552,15 @@ final class PostChain implements AutoCloseable {
 		} else {
 			colorFormats = new int[p.drawBuffers.length];
 			for (int i = 0; i < colorFormats.length; i++) {
-				colorFormats[i] = RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[p.drawBuffers[i]]));
+				colorFormats[i] = shadowcomp ? shadowColorImage(p.drawBuffers[i]).format()
+					: RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[p.drawBuffers[i]]));
 			}
 		}
 		// Iris CompositeRenderer: blending is off unless the program's blend directive (or a per-buffer one) turns it on
 		GraphicsProgram.Blend[] blends = new GraphicsProgram.Blend[colorFormats.length];
 		GraphicsProgram.Blend base = d.getBlendModeOverride().map(PostChain::blend).orElse(null);
 		Arrays.fill(blends, base);
-		if (!isFinal) {
+		if (!isFinal && !shadowcomp) { // Iris's shadowcomp Pass applies only the program-wide blend override
 			for (var info : d.getBufferBlendOverrides()) {
 				for (int i = 0; i < p.drawBuffers.length; i++) {
 					if (p.drawBuffers[i] == info.index()) blends[i] = blend(new BlendModeOverride(info.blendMode()));
@@ -547,8 +568,8 @@ final class PostChain implements AutoCloseable {
 			}
 		}
 		for (int i = 0; i < blends.length; i++) {
-			if (blends[i] != null && !isFinal && VkFormats.isInteger(targetFormats[p.drawBuffers[i]])) {
-				throw new IllegalStateException(p.name + ": blending into integer colortex" + p.drawBuffers[i] + " (Vulkan forbids it; GL ignores it)");
+			if (blends[i] != null && !isFinal && VkFormats.isInteger(shadowcomp ? shadowFormat(p.drawBuffers[i]) : targetFormats[p.drawBuffers[i]])) {
+				throw new IllegalStateException(p.name + ": blending into integer " + (shadowcomp ? "shadowcolor" : "colortex") + p.drawBuffers[i] + " (Vulkan forbids it; GL ignores it)");
 			}
 		}
 		p.program = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec(p.name, stages, spirv, bindings, attributes, 20,
@@ -860,21 +881,83 @@ final class PostChain implements AutoCloseable {
 		}
 	}
 
-	/** Iris ShadowCompositeRenderer: shadowcomp computes (fragment shadowcomp passes are reported, not drawn yet). */
-	private void buildShadowComposite(ShaderCompiler compiler, Set<Integer> used) {
+	/**
+	 * Iris ShadowCompositeRenderer's constructor: the shadowcolor flips (shadowcomp_pre, then each fragment program's draw
+	 * buffers unless flipped "false", then its explicit "true" flips). {@code perPass}, if given, gets each index's
+	 * snapshot before its program. Returns the final state.
+	 */
+	private Set<Integer> shadowCompositeFlips(List<Set<Integer>> perPass) {
+		Set<Integer> flipped = new TreeSet<>();
+		directives.getExplicitFlips("shadowcomp_pre").forEach((b, flip) -> {
+			if (flip) toggle(flipped, b);
+		});
 		for (ProgramSource src : set.getComposite(ProgramArrayId.ShadowComposite)) {
-			if (src != null && src.isValid()) notes.add(src.getName() + ": fragment shadowcomp programs are not drawn yet (not implemented yet)");
+			if (perPass != null) perPass.add(Set.copyOf(flipped));
+			if (src == null || !src.isValid()) continue;
+			var d = src.getDirectives();
+			int[] drawBuffers = d.hasUnknownDrawBuffers() ? new int[]{0, 1} : d.getDrawBuffers();
+			for (int b : drawBuffers) if (d.getExplicitFlips().get(b) != Boolean.FALSE) toggle(flipped, b);
+			d.getExplicitFlips().forEach((b, flip) -> {
+				if (flip) toggle(flipped, b);
+			});
 		}
-		List<Compute> list = new ArrayList<>();
-		for (ComputeSource[] cs : set.getCompute(ProgramArrayId.ShadowComposite)) {
-			list.addAll(buildComputes(compiler, cs, TextureStage.SHADOWCOMP, used, Set.of()));
-		}
-		shadowComposite = list;
-		for (ComputeSource c : set.getShadowCompute()) {
-			if (c != null && c.getSource().isPresent()) notes.add(c.getName() + ": shadow compute programs (shadow.csh) are not run yet (not implemented yet)");
-		}
-		if (!list.isEmpty()) notes.add("shadowcomp: " + list.size() + " compute program(s) run after the shadow pass");
+		return Set.copyOf(flipped);
 	}
+
+	private static void toggle(Set<Integer> set, int b) {
+		if (!set.remove(b)) set.add(b);
+	}
+
+	/** Iris ShadowCompositeRenderer (shadowcomp computes and fragment programs) and IrisRenderingPipeline's shadow.csh. */
+	private void buildShadowComposite(ShaderCompiler compiler, Set<Integer> used) {
+		ProgramSource[] sources = set.getComposite(ProgramArrayId.ShadowComposite);
+		ComputeSource[][] computes = set.getCompute(ProgramArrayId.ShadowComposite);
+		List<Set<Integer>> snapshots = new ArrayList<>();
+		shadowCompositeFlips(snapshots);
+		Set<Integer> flippedOnce = new HashSet<>();
+		int computeCount = 0, fragmentCount = 0;
+		try {
+			resolvingShadowStage = "shadowcomp";
+			for (int i = 0; i < Math.max(sources.length, computes.length); i++) {
+				ProgramSource src = i < sources.length ? sources[i] : null;
+				ComputeSource[] cs = i < computes.length ? computes[i] : null;
+				shadowReadAlt = i < snapshots.size() ? snapshots.get(i) : shadowFlipFinal;
+				List<Compute> built = buildComputes(compiler, cs, TextureStage.SHADOWCOMP, used, Set.copyOf(flippedOnce));
+				computeCount += built.size();
+				if (src == null || !src.isValid()) {
+					if (!built.isEmpty()) {
+						Pass p = new Pass();
+						p.name = built.get(0).name;
+						p.computes = built;
+						shadowComposite.add(p);
+					}
+					continue;
+				}
+				Pass p = build(compiler, src, TextureStage.SHADOWCOMP, false, used, flippedOnce);
+				p.computes = built;
+				p.shadowReadsAlt = shadowReadAlt;
+				for (int b : p.drawBuffers) {
+					// the pass writes the texture it doesn't read
+					if (p.shadowReadsAlt.contains(b)) shadowColorImage(b);
+					else shadowColorAltImage(b);
+				}
+				shadowComposite.add(p);
+				fragmentCount++;
+			}
+			resolvingShadowStage = "shadow.csh";
+			shadowReadAlt = null;
+			shadowComputes = buildComputes(compiler, set.getShadowCompute(), TextureStage.GBUFFERS_AND_SHADOW, used, Set.of());
+		} finally {
+			resolvingShadowStage = null;
+			shadowReadAlt = null;
+		}
+		if (computeCount + fragmentCount > 0) {
+			notes.add("shadowcomp: " + computeCount + " compute and " + fragmentCount + " fragment program(s) run after the shadow pass"
+				+ (shadowFlipFinal.isEmpty() ? "" : "; shadowcolors read from alt afterwards: " + shadowFlipFinal));
+		}
+		if (!shadowComputes.isEmpty()) notes.add("shadow.csh: " + shadowComputes.size() + " compute program(s) run before the shadow pass");
+	}
+
 
 	/** Iris BlendModeOverride (GL blend factors) as a Vulkan blend; OFF = no blending. */
 	private static GraphicsProgram.Blend blend(BlendModeOverride o) {
@@ -1618,12 +1701,14 @@ final class PostChain implements AutoCloseable {
 	}
 
 	private void requireStorageFormat(String name, int format) {
+		if (!storageFormat(format)) throw new IllegalStateException("image " + name + ": format " + format + " cannot be a storage image on this GPU");
+	}
+
+	private boolean storageFormat(int format) {
 		try (MemoryStack s = MemoryStack.stackPush()) {
 			VkFormatProperties props = VkFormatProperties.calloc(s);
 			vkGetPhysicalDeviceFormatProperties(ctx.physicalDevice(), format, props);
-			if ((props.optimalTilingFeatures() & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0) {
-				throw new IllegalStateException("image " + name + ": format " + format + " cannot be a storage image on this GPU");
-			}
+			return (props.optimalTilingFeatures() & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
 		}
 	}
 
@@ -1733,9 +1818,17 @@ final class PostChain implements AutoCloseable {
 				used.add(i);
 				return new TargetImage(i);
 			}
+			if (shadowPass && n.matches("shadowcolorimg\\d+")) {
+				// Iris IrisImages.addShadowColorImages: the texture the stage reads (flip state), as an image
+				int i = Integer.parseInt(n.substring("shadowcolorimg".length()));
+				GpuImage img = shadowColorRead(i);
+				requireStorageFormat(n, img.format());
+				return new CustomImage(img, VkFormats.isInteger(shadowFormat(i)));
+			}
 			CustomImage ci = customImage(pass, n, false);
 			if (ci != null) return ci;
-			throw new IllegalStateException(pass + ": image " + n + " is neither colorimgN nor a pack image (shadowcolorimg needs the shadow pass, not implemented yet)");
+			throw new IllegalStateException(pass + ": image " + n + " is neither colorimgN, shadowcolorimgN nor a pack image"
+				+ (shadowPass ? "" : " (shadowcolorimg needs a shadow pass)"));
 		}
 		// Iris CustomTextureSamplerInterceptor: this stage's custom textures win over built-in names, except a colortex
 		// (or its legacy alias) that an earlier pass of the stage already wrote
@@ -1756,6 +1849,14 @@ final class PostChain implements AutoCloseable {
 				for (String name : names) {
 					if (perStage.containsKey(name)) return customTexture(pass, name, perStage.get(name), d.type());
 				}
+			}
+		}
+		if (resolvingShadowStage != null && d.kind() == ShaderResourceLayout.Kind.SAMPLER) {
+			// Iris: shadowcomp programs get no colortex or depth samplers, shadow.csh gets colortex but no depth samplers
+			boolean depthName = n.equals("depthtex0") || n.equals("depthtex1") || n.equals("depthtex2") || n.equals("gdepthtex");
+			if (depthName || target >= 0 && resolvingShadowStage.equals("shadowcomp")) {
+				notes.add(pass + ": " + n + " is not bound in " + resolvingShadowStage + " on Iris; zero stand-in");
+				return dummy(d.type(), 0f);
 			}
 		}
 		if (target >= 0) {
@@ -2442,9 +2543,7 @@ final class PostChain implements AutoCloseable {
 		if (shadowColor[index] == null) {
 			PackShadowDirectives.SamplingSettings st = shadowDirectives.getColorSamplingSettings().computeIfAbsent(index, i -> new PackShadowDirectives.SamplingSettings());
 			int fmt = RenderTargetSet.renderableFormat(ctx, VkFormats.of(st.getFormat()));
-			GpuImage img = alloc.createImage("shadowcolor" + index, fmt, shadowResolution, shadowResolution,
-				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-				VK_IMAGE_ASPECT_COLOR_BIT);
+			GpuImage img = alloc.createImage("shadowcolor" + index, fmt, shadowResolution, shadowResolution, shadowColorUsage(fmt), VK_IMAGE_ASPECT_COLOR_BIT);
 			ownedImages.add(img);
 			shadowColor[index] = img;
 			boolean integer = VkFormats.isInteger(st.getFormat());
@@ -2455,12 +2554,52 @@ final class PostChain implements AutoCloseable {
 		return shadowColor[index];
 	}
 
+	/** shadowcolorimgN binds the shadowcolor as a storage image, where the format allows it. */
+	private int shadowColorUsage(int fmt) {
+		return VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+			| (storageFormat(fmt) ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+	}
+
+	/** The GL format of shadowcolorN (PackShadowDirectives). */
+	private net.irisshaders.iris.gl.texture.InternalTextureFormat shadowFormat(int index) {
+		return shadowDirectives.getColorSamplingSettings().computeIfAbsent(index, i -> new PackShadowDirectives.SamplingSettings()).getFormat();
+	}
+
+	/** Iris RenderTarget's alt texture of shadowcolorN: same format and size, also fully cleared when created. */
+	private GpuImage shadowColorAltImage(int index) {
+		GpuImage main = shadowColorImage(index);
+		if (shadowColorAlt[index] == null) {
+			GpuImage img = alloc.createImage("shadowcolor" + index + " alt", main.format(), shadowResolution, shadowResolution,
+				shadowColorUsage(main.format()), VK_IMAGE_ASPECT_COLOR_BIT);
+			ownedImages.add(img);
+			shadowColorAlt[index] = img;
+			PackShadowDirectives.SamplingSettings st = shadowDirectives.getColorSamplingSettings().get(index);
+			boolean integer = VkFormats.isInteger(st.getFormat());
+			uploads.add(() -> clearColor(img, st.getClearColor(), integer));
+		}
+		return shadowColorAlt[index];
+	}
+
+	/** The shadowcolorN texture a program reads: Iris ShadowRenderTargets.getColorTextureId, or a shadowcomp pass's snapshot. */
+	private GpuImage shadowColorRead(int index) {
+		return (shadowReadAlt != null ? shadowReadAlt : shadowFlipFinal).contains(index) ? shadowColorAltImage(index) : shadowColorImage(index);
+	}
+
+	private boolean separateHardwareSamplers() {
+		return set.getPack().hasFeature(net.irisshaders.iris.features.FeatureFlags.SEPARATE_HARDWARE_SAMPLERS);
+	}
+
 	/** Iris IrisSamplers.addShadowSamplers / ShadowRenderTargets.getSamplerFor, for the samplers Vulkan Iris draws. */
 	private Source shadowSource(String pass, String n, ShaderResourceLayout.Descriptor d) {
 		String type = d.type().toLowerCase(Locale.ROOT);
+		boolean separate = separateHardwareSamplers();
+		boolean hw = n.equals("shadowtex0HW") || n.equals("shadowtex1HW");
 		int depth = switch (n) {
 			case "shadowtex0", "watershadow" -> 0;
 			case "shadowtex1" -> 1;
+			// Iris: only with the SEPARATE_HARDWARE_SAMPLERS feature flag, and only for a hardware-filtered map
+			case "shadowtex0HW" -> separate && shadowDirectives.getDepthSamplingSettings().get(0).getHardwareFiltering() ? 0 : -1;
+			case "shadowtex1HW" -> separate && shadowDirectives.getDepthSamplingSettings().get(1).getHardwareFiltering() ? 1 : -1;
 			// with watershadow declared, "shadow" is the opaque-only map; otherwise it is shadowtex0
 			case "shadow" -> bindingWaterShadow ? 1 : 0;
 			default -> -1;
@@ -2468,7 +2607,9 @@ final class PostChain implements AutoCloseable {
 		if (depth >= 0) {
 			PackShadowDirectives.DepthSamplingSettings ds = shadowDirectives.getDepthSamplingSettings().get(depth);
 			boolean compare = type.contains("shadow");
-			if (compare != ds.getHardwareFiltering()) {
+			// with separate hardware samplers, the plain names have no sampler object (no compare); the HW names have it
+			boolean expected = separate && !hw ? false : ds.getHardwareFiltering();
+			if (compare != expected) {
 				// GL: compare mode comes from shadowHardwareFiltering, the result from the GLSL sampler type; a mismatch is
 				// undefined on GL. Vulkan needs the sampler to match the type, so the type decides
 				notes.add(pass + ": " + n + " is a " + d.type() + " but shadowHardwareFiltering" + depth + " = " + ds.getHardwareFiltering()
@@ -2484,7 +2625,7 @@ final class PostChain implements AutoCloseable {
 		if (color >= 0) {
 			PackShadowDirectives.SamplingSettings st = shadowDirectives.getColorSamplingSettings().computeIfAbsent(color, i -> new PackShadowDirectives.SamplingSettings());
 			// Iris binds GlSampler.LINEAR (clamp); Vulkan can't filter integer formats linearly
-			return new Fixed(shadowColorImage(color), VkFormats.isInteger(st.getFormat()) ? SamplerCache.NEAREST_CLAMP : SamplerCache.LINEAR_CLAMP);
+			return new Fixed(shadowColorRead(color), VkFormats.isInteger(st.getFormat()) ? SamplerCache.NEAREST_CLAMP : SamplerCache.LINEAR_CLAMP);
 		}
 		return null; // shadowtex0HW / shadowtex1HW / DH / shadowcolorimg: reported by the caller
 	}
@@ -2500,12 +2641,19 @@ final class PostChain implements AutoCloseable {
 		shadowModelView.set(modelView);
 		shadowProjection.set(projection);
 		clearDepth(shadowDepthImage(0), 1f);
+		// Iris IrisRenderingPipeline.beginLevelRendering: shadow computes after the depth clear, against the shadow map's size
+		if (!shadowComputes.isEmpty()) {
+			for (Compute c : shadowComputes) dispatch(c, shadowResolution, shadowResolution);
+			memoryBarrier();
+		}
+		// Iris ClearPassCreator.createShadowClearPasses: main and alt
 		for (int i = 0; i < shadowColor.length; i++) {
 			if (shadowColor[i] == null) continue;
 			PackShadowDirectives.SamplingSettings st = shadowDirectives.getColorSamplingSettings().get(i);
 			if (st != null && !st.getClear()) continue;
 			Vector4f c = st == null ? new Vector4f(1f) : st.getClearColor();
 			clearColor(shadowColor[i], c, st != null && VkFormats.isInteger(st.getFormat()));
+			if (shadowColorAlt[i] != null) clearColor(shadowColorAlt[i], c, st != null && VkFormats.isInteger(st.getFormat()));
 		}
 		shadowBegun = true;
 		shadowTranslucentCopied = false;
@@ -2551,11 +2699,7 @@ final class PostChain implements AutoCloseable {
 		segment(cmd, tracker);
 		if (!shadowTranslucentCopied) copyDepth(shadowDepth, shadowDepthNoTranslucent);
 		shadowTranslucentCopied = true;
-		if (!shadowComposite.isEmpty()) {
-			// Iris ShadowCompositeRenderer: computes dispatched against the shadow map's size
-			for (Compute c : shadowComposite) dispatch(c, shadowResolution, shadowResolution);
-			memoryBarrier();
-		}
+		for (Pass p : shadowComposite) runShadowComposite(p);
 		shadowBegun = false;
 		shadowFrames++;
 		endSegment();
@@ -2873,6 +3017,44 @@ final class PostChain implements AutoCloseable {
 		});
 	}
 
+	/**
+	 * Iris ShadowCompositeRenderer.renderAll, one pass: its computes, dispatched against the main render target's size
+	 * (Iris passes main.width / main.height, not the shadow map's), then its fragment program over the whole shadow map,
+	 * writing the shadowcolors it doesn't read.
+	 */
+	private void runShadowComposite(Pass p) {
+		if (!p.computes.isEmpty()) {
+			for (Compute c : p.computes) dispatch(c, targets.width(), targets.height());
+			memoryBarrier();
+		}
+		if (p.program == null) return;
+		GpuImage[] outs = new GpuImage[p.drawBuffers.length];
+		for (int i = 0; i < outs.length; i++) {
+			int b = p.drawBuffers[i];
+			outs[i] = p.shadowReadsAlt.contains(b) ? shadowColorImage(b) : shadowColorAltImage(b);
+		}
+		Resolved r = new Resolved(p.bounds, currentDepth);
+		for (GpuImage o : outs) {
+			if (r.sampled.contains(o) || r.storage.contains(o)) throw new IllegalStateException(p.name + " reads and renders to " + o.name());
+		}
+		r.declare(LayoutTracker.Use.SAMPLED_GRAPHICS, LayoutTracker.Use.STORAGE_FRAGMENT);
+		for (GpuImage o : outs) tracker.use(o, LayoutTracker.Use.COLOR_ATTACHMENT);
+		tracker.flush(cmd);
+		if (p.usesSsbo) memoryBarrier();
+		int slot = (int) (frame % SLOTS);
+		long ds = ring.allocate(p.program.setLayout());
+		r.write(ds, p.bounds, p.layout, p.ubo, p.stride, slot);
+		p.slotSubmit[slot] = clock.currentIndex();
+		p.program.draw(cmd, ds, outs, quad.buffer(), 6);
+		shadowCompositeDraws++;
+	}
+
+	private long shadowCompositeDraws;
+
+	long shadowCompositeDraws() {
+		return shadowCompositeDraws;
+	}
+
 	/** Iris FinalPassRenderer: buffers left reading from "alt" are copied back so the next frame starts unflipped. */
 	private void copyBack() {
 		for (int i = 0; i < RenderTargetSet.MAX_TARGETS; i++) {
@@ -2910,6 +3092,7 @@ final class PostChain implements AutoCloseable {
 	public void close() {
 		for (List<Pass> list : passes.values()) for (Pass p : list) if (p.program != null) p.program.close();
 		if (finalPass != null) finalPass.program.close();
+		for (Pass p : shadowComposite) if (p.program != null) p.program.close();
 		computePrograms.forEach(ComputeProgram::close);
 		for (Gbuffer g : terrain) if (g != null && g.program != null) g.program.close();
 		for (Vanilla v : vanilla.values()) for (GraphicsProgram[] arr : v.variants.values()) for (GraphicsProgram p : arr) if (p != null) p.close();

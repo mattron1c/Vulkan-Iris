@@ -28,7 +28,7 @@ renders the shadow maps. Once that works, packs render as they do on Iris and pe
 3. **7c: other geometry.** *(done for entities, block entities, sky and particles: 10 / 10 packs, see [PHASE7_STATUS.md](PHASE7_STATUS.md#slice-7c--vanilla-geometry-with-the-packs-programs); clouds, the hand and Iris's fallback shader followed in "7c gaps"; still open: extended entity attributes / entity IDs)* Swap vanilla `RenderPipeline`s on `VulkanRenderPass` for pack programs, using Iris's own `IrisPipelines` mapping:
    - `gbuffers_entities`, `_block`, `_hand`, `_skybasic`, `_skytextured`, `_clouds`, `_particles`, `_weather`, `_basic`, `_textured`, `_beaconbeam`, `_armor_glint`, `_spidereyes`
    - plus Iris's `entityId`/`blockEntityId` uniforms
-4. **7d: shadow pass.** *(done for terrain and entities: 10 / 10 packs, see [PHASE7_STATUS.md](PHASE7_STATUS.md#slice-7d--shadow-pass-terrain); entities and block entities followed; still open: fragment shadowcomp, shadow.csh, shadow mipmaps)*
+4. **7d: shadow pass.** *(done for terrain and entities: 10 / 10 packs, see [PHASE7_STATUS.md](PHASE7_STATUS.md#slice-7d--shadow-pass-terrain); entities and block entities followed; fragment shadowcomp with flipping, shadow.csh, shadowcolorimg and HW samplers followed, tested with a self-test pack; still open: shadow mipmaps)*
    - CPU side: Iris's `ShadowRenderer` logic, its shadow matrices, its culling and Sodium's section graph for the shadow view (Iris's `MixinRenderSectionManagerShadow`, ported).
    - GPU side: `shadow_*` programs into `shadowtex0/1` and `shadowcolor0/1`, then `shadowcomp` computes. These already work in the post chain.
 5. **7e: correctness sweep** over all 10 packs:

@@ -179,6 +179,12 @@ fun registerProdSelfTest(name: String, flag: String) =
         System.getProperty("vulkaniris.phase7.noshadow")?.let { jvmArgs.add("-Dvulkaniris.phase7.noshadow=$it") }
         System.getProperty("vulkaniris.phase7.noentityshadow")?.let { jvmArgs.add("-Dvulkaniris.phase7.noentityshadow=$it") }
         runDir.set(project.layout.projectDirectory.dir("run-prod"))
+        // Vulkan Iris's own self-test packs (fabric/testpacks, written for this repository) run next to the user's packs
+        val testPacks = project.layout.projectDirectory.dir("testpacks").asFile
+        val shaderPacks = project.layout.projectDirectory.dir("run-prod/shaderpacks").asFile
+        doFirst { testPacks.copyRecursively(shaderPacks, overwrite = true) }
+        // a self-test run is a measurement, never "up to date" (its inputs include the packs and the world)
+        outputs.upToDateWhen { false }
     }
 
 registerProdSelfTest("prodFirstLight", "vulkaniris.firstlight.selftest")

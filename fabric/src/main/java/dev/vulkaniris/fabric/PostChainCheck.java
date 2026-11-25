@@ -250,6 +250,8 @@ public final class PostChainCheck {
 		try (Stream<Path> s = Files.list(dir)) {
 			packs = s.filter(p -> p.toString().endsWith(".zip") || Files.isDirectory(p))
 				.filter(p -> wanted.isEmpty() || wanted.stream().anyMatch(w -> p.getFileName().toString().toLowerCase().contains(w)))
+				// the self-test packs check the shadow pass, which only Phase 7 (gbuffers) draws
+				.filter(p -> GBUFFERS || !p.getFileName().toString().startsWith("vulkaniris-selftest"))
 				.sorted().toList();
 		}
 		Files.createDirectories(outDir());
@@ -363,13 +365,22 @@ public final class PostChainCheck {
 		int distinct = distinctColours(rgba);
 		boolean flat = distinct < 16;
 		boolean pass = !flat && !(GBUFFERS && (terrainFailed || vanillaFailed));
+		String selfTest = null;
+		if (packName.startsWith("vulkaniris-selftest")) {
+			// fabric/testpacks: the final pass draws green when all its checks pass, else red + blue = the failed checks' bits
+			int o = (height / 2 * width + width / 2) * 4;
+			int r = rgba[o] & 0xFF, g = rgba[o + 1] & 0xFF, b = rgba[o + 2] & 0xFF;
+			pass = g >= 250 && r < 5 && b < 5 && !(GBUFFERS && (terrainFailed || vanillaFailed));
+			selfTest = pass ? "self-test pack: all checks passed" : "self-test pack: FAILED checks, bit mask " + Math.max(r, b) + " (pixel " + r + "," + g + "," + b + ")";
+		}
 		line(packFrames + " frames recorded" + (skippedFrames > 0 ? " (" + skippedFrames + " skipped: uniform slot still in flight)" : "")
 			+ ", CPU record time " + String.format("%.2f", recordNanos / 1e6 / Math.max(1, packFrames)) + " ms/frame (not a benchmark)");
 		line("output: " + st + ", differs from vanilla in " + (100L * differing / total) + "% of pixels");
 		for (String n : chain.notes()) line("  note: " + n);
 		chain.uniformFailures().forEach((k, v) -> line("  uniform " + k + " threw " + v + " (written as 0)"));
+		if (selfTest != null) line(selfTest);
 		line(pass ? "PASS (renders; see notes for what is not implemented yet)"
-			: flat ? "FAIL: output is (nearly) a flat colour (" + distinct + " distinct)" : "FAIL: terrain programs did not draw (see above)");
+			: selfTest != null ? "FAIL: self-test checks" : flat ? "FAIL: output is (nearly) a flat colour (" + distinct + " distinct)" : "FAIL: terrain programs did not draw (see above)");
 		if (pass) passedPacks++;
 		allPassed &= pass;
 		if (chain.hasTerrain()) line("terrain: " + terrainPasses + " terrain passes drawn with the pack's programs over " + (rebuildFrames + packFrames)
@@ -386,6 +397,7 @@ public final class PostChainCheck {
 				line("shadow entities: " + shadowEntities + " entity and " + shadowBlockEntities + " block entity submissions over "
 					+ shadowPasses + " shadow passes (entity culling: " + VulkanShadow.entityCulling + ")");
 				line("shadow entity probe (shadow pass " + PROBE_PASS + "): " + probeResult);
+				if (chain.shadowCompositeDraws() > 0) line("shadowcomp: " + chain.shadowCompositeDraws() + " fragment shadowcomp draws");
 				if (!chain.shadowDropped.isEmpty()) line("  note: shadow pass draws skipped (no shadow program): " + chain.shadowDropped);
 			} else {
 				line("shadow: no shadow pass for this pack");
