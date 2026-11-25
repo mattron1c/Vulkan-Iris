@@ -116,11 +116,26 @@ public final class PostChainCheck {
 	private PostChainCheck() {
 	}
 
+	/** Bench mode (B side of {@link Bench}): the current pack's measurement, started once its chunks were rebuilt. */
+	private static Bench bench;
+	private static boolean benchDone;
+
 	/** GameRenderer.render TAIL: world setup and timeouts. */
 	public static void afterGameRender() {
 		if (ENABLED && done && !tornDown && finishSubmit >= 0 && PolydiumAccess.submitCompleted(finishSubmit)) teardown();
 		if (!ENABLED || done) return;
 		frames++;
+		// bench: the vanilla control (packIndex -1, Polydium alone) once the harness is up, then each pack after its rebuild
+		if (Bench.ENABLED && !benchDone && (packIndex < 0 ? ctx != null : chain != null && chain.hasTerrain() && rebuildFrames >= REBUILD_FRAMES)) {
+			if (bench == null) {
+				bench = new Bench();
+				bench.warmUp();
+			}
+			if (bench.frame()) {
+				benchDone = true;
+				line((packIndex < 0 ? "bench (no pack: vanilla on Polydium Vulkan): " : "bench: ") + bench.result());
+			}
+		}
 		try {
 			Minecraft mc = Minecraft.getInstance();
 			if (mc.level == null) {
@@ -128,7 +143,8 @@ public final class PostChainCheck {
 			} else {
 				worldFrames++;
 			}
-			if (frames > TIMEOUT_FRAMES) fail("timed out (world frames " + worldFrames + ", pack index " + packIndex + ")");
+			// bench mode measures for a fixed time, so at high frame rates it needs far more frames
+			if (frames > (Bench.ENABLED ? TIMEOUT_FRAMES * 50L : TIMEOUT_FRAMES)) fail("timed out (world frames " + worldFrames + ", pack index " + packIndex + ")");
 		} catch (Throwable t) {
 			Iris.logger.error("[Vulkan Iris] phase 6 test crashed", t);
 			fail("exception: " + t);
@@ -207,7 +223,7 @@ public final class PostChainCheck {
 			recordNanos += System.nanoTime() - t0;
 			if (rebuildFrames < REBUILD_FRAMES) rebuildFrames++;
 			else packFrames++;
-			capture = packFrames >= FRAMES_PER_PACK;
+			capture = Bench.ENABLED ? benchDone : packFrames >= FRAMES_PER_PACK;
 		} else if (chain != null) {
 			long t0 = System.nanoTime();
 			boolean recorded = chain.record(cmd, tracker, color, depth);
@@ -219,7 +235,7 @@ public final class PostChainCheck {
 			}
 			capture = packFrames >= FRAMES_PER_PACK;
 		} else {
-			capture = true; // vanilla
+			capture = !Bench.ENABLED || benchDone; // vanilla (in bench mode: after the no-pack control was measured)
 		}
 		if (capture) {
 			if (readback != null) readback.close();
@@ -251,12 +267,18 @@ public final class PostChainCheck {
 			packs = s.filter(p -> p.toString().endsWith(".zip") || Files.isDirectory(p))
 				.filter(p -> wanted.isEmpty() || wanted.stream().anyMatch(w -> p.getFileName().toString().toLowerCase().contains(w)))
 				// the self-test packs check the shadow pass, which only Phase 7 (gbuffers) draws
-				.filter(p -> GBUFFERS || !p.getFileName().toString().startsWith("vulkaniris-selftest"))
+				.filter(p -> GBUFFERS && !Bench.ENABLED || !p.getFileName().toString().startsWith("vulkaniris-selftest"))
 				.sorted().toList();
 		}
 		Files.createDirectories(outDir());
 		var mc = Minecraft.getInstance();
 		if (GBUFFERS) placeScene(mc);
+		if (Bench.ENABLED) {
+			Bench.freeze(mc);
+			Bench.options(mc);
+			line("B side: Vulkan Iris; options: " + Bench.settings(mc) + "; measured " + Bench.SECONDS + " s after " + Bench.WARMUP_SECONDS
+				+ " s warm-up (self-test readback probe off)");
+		}
 		line("Backend: " + PolydiumAccess.backendDescription());
 		line("World '" + WORLD + "', player at " + mc.player.blockPosition().toShortString() + ", day time " + mc.level.getDayTime()
 			+ ", main target " + mc.getMainRenderTarget().width + "x" + mc.getMainRenderTarget().height);
@@ -267,7 +289,7 @@ public final class PostChainCheck {
 	 * Phase 7c: entities and a block entity in front of the camera, so the vanilla draws have something to draw. Plain
 	 * vanilla commands on the integrated server; earlier runs' entities (tag vi7c) are removed first.
 	 */
-	private static void placeScene(Minecraft mc) {
+	static void placeScene(Minecraft mc) {
 		var server = mc.getSingleplayerServer();
 		if (server == null) return;
 		String[] commands = {
@@ -284,7 +306,7 @@ public final class PostChainCheck {
 		line("scene: summoned a pig, a sheep and an armor stand and placed a chest in front of the player");
 	}
 
-	private static void run(Minecraft mc, String... commands) {
+	static void run(Minecraft mc, String... commands) {
 		var server = mc.getSingleplayerServer();
 		if (server == null) return;
 		server.execute(() -> {
@@ -301,6 +323,8 @@ public final class PostChainCheck {
 		Path pack = packs.get(packIndex);
 		packName = pack.getFileName().toString();
 		packFrames = 0;
+		bench = null;
+		benchDone = false;
 		skippedFrames = 0;
 		recordNanos = 0;
 		line("");
@@ -677,7 +701,7 @@ public final class PostChainCheck {
 				shadowActive = true;
 				try {
 					finishProbe();
-					boolean probing = shadowPasses == PROBE_PASS && probeBefore == null;
+					boolean probing = !Bench.ENABLED && shadowPasses == PROBE_PASS && probeBefore == null;
 					VulkanShadow.beforeEntities = probing ? () -> probe(false) : null;
 					VulkanShadow.afterEntities = probing ? () -> probe(true) : null;
 					VulkanShadow.draw(chain.directives(), view, camera, cameraState, true);

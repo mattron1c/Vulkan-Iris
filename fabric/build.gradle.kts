@@ -178,6 +178,9 @@ fun registerProdSelfTest(name: String, flag: String) =
         // A/B: gradlew :fabric:prodPhase7 -Dvulkaniris.phase7.noshadow=true skips the shadow draws
         System.getProperty("vulkaniris.phase7.noshadow")?.let { jvmArgs.add("-Dvulkaniris.phase7.noshadow=$it") }
         System.getProperty("vulkaniris.phase7.noentityshadow")?.let { jvmArgs.add("-Dvulkaniris.phase7.noentityshadow=$it") }
+        // benchmark length: gradlew :fabric:prodBenchVulkan -Dvulkaniris.bench.seconds=60 -Dvulkaniris.bench.warmup=20
+        System.getProperty("vulkaniris.bench.seconds")?.let { jvmArgs.add("-Dvulkaniris.bench.seconds=$it") }
+        System.getProperty("vulkaniris.bench.warmup")?.let { jvmArgs.add("-Dvulkaniris.bench.warmup=$it") }
         runDir.set(project.layout.projectDirectory.dir("run-prod"))
         // Vulkan Iris's own self-test packs (fabric/testpacks, written for this repository) run next to the user's packs
         val testPacks = project.layout.projectDirectory.dir("testpacks").asFile
@@ -196,3 +199,18 @@ registerProdSelfTest("prodPhase5", "vulkaniris.phase5.selftest")
 registerProdSelfTest("prodPhase6", "vulkaniris.phase6.selftest")
 // gradlew :fabric:prodPhase7 — Phase 6 test with terrain drawn by each pack's gbuffers_terrain/_cutout/_water programs
 registerProdSelfTest("prodPhase7", "vulkaniris.phase7.selftest")
+
+// A/B benchmark (docs/vulkan-iris/BENCHMARK.md). B: Vulkan Iris on Polydium, through the Phase 7 harness in bench mode
+registerProdSelfTest("prodBenchVulkan", "vulkaniris.phase7.selftest").configure { jvmArgs.add("-Dvulkaniris.bench=true") }
+// A: the same jar on GL, without Polydium (Iris 1.10.8's own GL pipeline on Sodium), driven by GlBench
+tasks.register<net.fabricmc.loom.task.prod.ClientProductionRunTask>("prodBenchGl") {
+    group = "vulkan iris"
+    mods.from(tasks.named("remapJar"))
+    mods.from(SODIUM_DEPENDENCY_FABRIC)
+    jvmArgs.addAll("-Dorg.lwjgl.system.stackSize=256", "-Dvulkaniris.bench=true")
+    System.getProperty("vulkaniris.phase6.packs")?.let { jvmArgs.add("-Dvulkaniris.phase6.packs=$it") }
+    System.getProperty("vulkaniris.bench.seconds")?.let { jvmArgs.add("-Dvulkaniris.bench.seconds=$it") }
+    System.getProperty("vulkaniris.bench.warmup")?.let { jvmArgs.add("-Dvulkaniris.bench.warmup=$it") }
+    runDir.set(project.layout.projectDirectory.dir("run-prod"))
+    outputs.upToDateWhen { false }
+}
