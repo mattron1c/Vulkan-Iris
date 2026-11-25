@@ -86,12 +86,19 @@ public final class VanillaHook {
 		int x, y, w, h;
 		int[] scissor;
 		boolean suspended;
+		com.mojang.blaze3d.buffers.GpuBuffer vertexBuffer;
 	}
 
 	private static Current current;
 	private static Object rejectedPass;
-	private static final java.util.Set<Object> createdPasses = java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
-	private static final java.util.Set<Object> closedPasses = java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
+	/**
+	 * Diagnostics only (why a draw was not redirected): recent passes by identity, dropped at {@link #RECENT_PASSES}.
+	 * Not weak maps: Blaze3D creates hundreds of passes a frame, and a WeakHashMap's stale entries were purged on the
+	 * render thread after each GC, in one go: a 20-30 ms frame every 2-3 s (found with JFR, see BENCHMARK.md).
+	 */
+	private static final java.util.Set<Object> createdPasses = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+	private static final java.util.Set<Object> closedPasses = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+	private static final int RECENT_PASSES = 4096;
 	private static String rejectReason;
 	private static long redirectedPasses;
 
@@ -125,16 +132,17 @@ public final class VanillaHook {
 
 	/** Diagnostics: draws per vanilla pipeline while the pack is active ("[other target]": a pass not on the main target). */
 	private static final Map<String, Long> seen = new java.util.TreeMap<>();
-	/** The vertex buffer each pass has on binding 0 (VulkanRenderPass.setVertexBuffer binds it right away, keeps no field). */
-	private static final Map<Object, com.mojang.blaze3d.buffers.GpuBuffer> vertexBuffers = new java.util.WeakHashMap<>();
-
-	/** VulkanRenderPass.setVertexBuffer HEAD. */
+	/**
+	 * VulkanRenderPass.setVertexBuffer HEAD: the redirected pass's buffer on binding 0 (Polydium binds it right away and
+	 * keeps no field). Only the tracked pass needs it, so it lives in {@link Current}.
+	 */
 	public static void vertexBuffer(VulkanRenderPass pass, int slot, com.mojang.blaze3d.buffers.GpuBuffer buffer) {
-		if (slot == 0 && sink != null) vertexBuffers.put(pass, buffer);
+		Current cur = current;
+		if (slot == 0 && cur != null && cur.pass == pass) cur.vertexBuffer = buffer;
 	}
 
-	private static PostChain.VertexSource vertexSource(VulkanRenderPass pass) {
-		var b = vertexBuffers.get(pass);
+	private static PostChain.VertexSource vertexSource(Current cur) {
+		var b = cur.vertexBuffer;
 		if (!(b instanceof VulkanGpuBuffer vb)) return null;
 		// Polydium's transient buffers are created with uniform-texel-buffer usage; its direct buffers only when Blaze3D asks
 		boolean texel = b.getClass().getName().endsWith("TransientGpuBuffer") || (b.usage() & com.mojang.blaze3d.buffers.GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER) != 0;
@@ -156,6 +164,7 @@ public final class VanillaHook {
 		rejectedPass = backend;
 		Sink s = sink;
 		if (s != null) {
+			if (createdPasses.size() >= RECENT_PASSES) createdPasses.clear();
 			createdPasses.add(backend);
 			closedPasses.remove(backend);
 		}
@@ -228,7 +237,7 @@ public final class VanillaHook {
 				PolydiumAccess.polydiumBarrier(cmd);
 				cur.suspended = true;
 			}
-			s.draw(cmd, key, info, new State(uniforms, textures, outW, outH, cur.scissor, vertexSource(pass)), hasDepth, indexed, a, b, c, d, e);
+			s.draw(cmd, key, info, new State(uniforms, textures, outW, outH, cur.scissor, vertexSource(cur)), hasDepth, indexed, a, b, c, d, e);
 			return HANDLED;
 		} catch (Throwable t) {
 			s.failed(t);
@@ -275,7 +284,10 @@ public final class VanillaHook {
 	public static void close(VulkanRenderPass pass, VkCommandBuffer cmd, VulkanRenderPipeline pipeline, boolean hasDepth) {
 		resume(pass, cmd, pipeline, hasDepth);
 		if (current != null && current.pass == pass) current = null;
-		if (sink != null) closedPasses.add(pass);
+		if (sink != null) {
+			if (closedPasses.size() >= RECENT_PASSES) closedPasses.clear();
+			closedPasses.add(pass);
+		}
 	}
 
 	/** VulkanRenderPass.enableScissor TAIL; clamped the way Polydium's setScissor does (negative offset shrinks the extent). */

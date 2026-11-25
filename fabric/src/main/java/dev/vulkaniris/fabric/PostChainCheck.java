@@ -119,6 +119,7 @@ public final class PostChainCheck {
 	/** Bench mode (B side of {@link Bench}): the current pack's measurement, started once its chunks were rebuilt. */
 	private static Bench bench;
 	private static boolean benchDone;
+	private static long benchVariants;
 
 	/** GameRenderer.render TAIL: world setup and timeouts. */
 	public static void afterGameRender() {
@@ -131,9 +132,14 @@ public final class PostChainCheck {
 				bench = new Bench();
 				bench.warmUp();
 			}
+			boolean wasMeasuring = bench.measuring();
 			if (bench.frame()) {
 				benchDone = true;
 				line((packIndex < 0 ? "bench (no pack: vanilla on Polydium Vulkan): " : "bench: ") + bench.result());
+				if (chain != null) line("  pipelines built on first use while measuring: " + (chain.variantsBuilt() - benchVariants)
+					+ " (slowest pipeline build of the pack: " + String.format("%.1f", chain.variantMaxNanos() / 1e6) + " ms)");
+			} else if (!wasMeasuring && bench.measuring() && chain != null) {
+				benchVariants = chain.variantsBuilt();
 			}
 		}
 		try {

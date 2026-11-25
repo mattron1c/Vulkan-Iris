@@ -18,6 +18,8 @@ final class Bench {
 
 	private long[] frames = new long[1 << 16];
 	private int count;
+	/** Frames over 20 ms: JVM uptime at their end (as in -Xlog's uptime) and length, to line up with a GC log. */
+	private final java.util.List<String> spikes = new java.util.ArrayList<>();
 	private long last = -1, warmStart = -1, measureStart = -1, measureEnd = -1;
 
 	/** Starts the warm-up clock (call once the pack is active and its chunks were rebuilt). */
@@ -27,6 +29,10 @@ final class Bench {
 
 	boolean warming() {
 		return warmStart >= 0;
+	}
+
+	boolean measuring() {
+		return measureStart >= 0 && measureEnd < 0;
 	}
 
 	/** Once per frame; returns true once the measurement is over. */
@@ -39,6 +45,9 @@ final class Bench {
 			return false;
 		}
 		if (count == frames.length) frames = Arrays.copyOf(frames, count * 2);
+		if (now - last > 20_000_000L && spikes.size() < 40) {
+			spikes.add(String.format("%.3fs:%.1fms", java.lang.management.ManagementFactory.getRuntimeMXBean().getUptime() / 1000.0, (now - last) / 1e6));
+		}
 		frames[count++] = now - last;
 		last = now;
 		if (now - measureStart >= SECONDS * 1_000_000_000L) measureEnd = now;
@@ -54,9 +63,14 @@ final class Bench {
 		int worst = Math.max(1, count / 100);
 		long worstSum = 0;
 		for (int i = count - worst; i < count; i++) worstSum += f[i];
-		return String.format("%d frames in %.1f s: average %.1f FPS, 1%% low %.1f FPS; frame time median %.2f ms, p99 %.2f ms, max %.2f ms",
+		int over20 = 0, over10 = 0;
+		for (long x : f) {
+			if (x > 20_000_000L) over20++;
+			if (x > 10_000_000L) over10++;
+		}
+		return String.format("%d frames in %.1f s: average %.1f FPS, 1%% low %.1f FPS; frame time median %.2f ms, p99 %.2f ms, max %.2f ms; %d frames > 10 ms, %d > 20 ms",
 			count, seconds, count / seconds, worst / (worstSum / 1e9), f[count / 2] / 1e6, f[Math.min(count - 1, (int) (count * 0.99))] / 1e6,
-			f[count - 1] / 1e6);
+			f[count - 1] / 1e6, over10, over20) + (spikes.isEmpty() ? "" : "; spikes (JVM uptime:length): " + spikes);
 	}
 
 	/**

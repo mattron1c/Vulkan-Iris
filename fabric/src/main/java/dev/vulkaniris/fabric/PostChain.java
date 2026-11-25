@@ -1474,8 +1474,12 @@ final class PostChain implements AutoCloseable {
 		int mask = (p.isWriteColor() ? VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT : 0) | (p.isWriteAlpha() ? VK_COLOR_COMPONENT_A_BIT : 0);
 		var raster = new GraphicsProgram.Raster(depth ? (v.shadow ? VK_FORMAT_D32_SFLOAT : mainDepthFormat) : 0, test, depth && p.isWriteDepth(), depthCompare(p.getDepthTestFunction()),
 			p.isCull() ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE, v.pushSize, mask, p.getDepthBiasConstant(), p.getDepthBiasScaleFactor());
+		long t0 = System.nanoTime();
 		arr[i] = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec(v.name + " / " + p.getLocation(), v.stages, v.spirv, v.bindings, attributes,
 			format.getVertexSize(), topology(p.getVertexFormatMode()), colorFormats, blends, raster));
+		long dt = System.nanoTime() - t0;
+		variantsBuilt++;
+		variantMaxNanos = Math.max(variantMaxNanos, dt);
 		return arr[i];
 	}
 
@@ -1642,6 +1646,17 @@ final class PostChain implements AutoCloseable {
 		info[5] = f.contains(VertexFormatElement.NORMAL) ? f.getOffset(VertexFormatElement.NORMAL) / 4 : -1;
 		derivedDraws++;
 		return info;
+	}
+
+	/** Pipelines built on first use of a vanilla render state (each a vkCreateGraphicsPipelines on the render thread). */
+	private long variantsBuilt, variantMaxNanos;
+
+	long variantsBuilt() {
+		return variantsBuilt;
+	}
+
+	long variantMaxNanos() {
+		return variantMaxNanos;
 	}
 
 	long derivedDraws() {
