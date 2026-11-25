@@ -19,6 +19,8 @@ import dev.vulkaniris.vk.DescriptorRing;
 import dev.vulkaniris.vk.DescriptorWrites;
 import dev.vulkaniris.vk.DeferredDestroyer;
 import dev.vulkaniris.vk.FrameClock;
+import dev.vulkaniris.vk.SpirvUse;
+import net.irisshaders.iris.helpers.OptionalBoolean;
 import dev.vulkaniris.vk.GpuAllocator;
 import dev.vulkaniris.vk.GpuBuffer;
 import dev.vulkaniris.vk.GpuImage;
@@ -391,6 +393,69 @@ final class PostChain implements AutoCloseable {
 			close();
 			throw e;
 		}
+		decideShadowPass();
+	}
+
+	/** Iris IrisSamplers.hasShadowSamplers: the sampler names that make Iris create its shadow targets. */
+	private static boolean isShadowSampler(String n) {
+		return switch (n) {
+			case "shadowtex0", "shadowtex0DH", "shadowtex0HW", "shadowtex1", "shadowtex1HW", "shadowtex1DH", "shadow", "watershadow", "shadowcolor" -> true;
+			default -> n.matches("shadowcolor(img)?\\d+");
+		};
+	}
+
+	/** Set when the pack has shadow programs, but Iris on GL would not run a shadow pass (see decideShadowPass). */
+	private boolean shadowUnused;
+	private final List<String> shadowSamplerUsers = new ArrayList<>();
+
+	/**
+	 * Iris IrisRenderingPipeline creates its ShadowRenderTargets, and so a ShadowRenderer, only when shadow.enabled is
+	 * true, or when a non-shadow program binds one of the shadow samplers. Otherwise a pack's shadow programs never
+	 * run. Iris asks GL whether the sampler uniform is active after linking, so a declared but unused sampler doesn't
+	 * count; here {@link SpirvUse} finds the bindings the SPIR-V actually reads. It can only over-report, so at worst
+	 * this runs a shadow pass Iris doesn't, never the other way round.
+	 */
+	private void decideShadowPass() {
+		if (!shadowPass || shadowDirectives.isShadowEnabled() == OptionalBoolean.TRUE) return;
+		ShadowUseCheck check = (name, layout, spirv) -> {
+			if (layout == null || spirv == null) return;
+			Set<Long> live = null;
+			for (ShaderResourceLayout.Descriptor d : layout.descriptors()) {
+				if (!isShadowSampler(d.name())) continue;
+				if (live == null) live = SpirvUse.usedBindings(spirv);
+				if (live.contains((long) d.set() << 32 | (d.binding() & 0xFFFFFFFFL))) shadowSamplerUsers.add(name + ": " + d.name());
+			}
+		};
+		for (List<Pass> list : passes.values()) for (Pass p : list) {
+			if (p.program != null) check.accept(p.name, p.layout, p.program.spec().spirv());
+			for (Compute c : p.computes) check.accept(c.name, c.layout, List.of(c.program.spirv()));
+		}
+		if (finalPass != null) {
+			check.accept(finalPass.name, finalPass.layout, finalPass.program.spec().spirv());
+			for (Compute c : finalPass.computes) check.accept(c.name, c.layout, List.of(c.program.spirv()));
+		}
+		for (Compute c : setup) check.accept(c.name, c.layout, List.of(c.program.spirv()));
+		for (Gbuffer g : terrain) if (g != null && g.program != null) check.accept(g.name, g.layout, g.program.spec().spirv());
+		for (Vanilla v : vanilla.values()) {
+			if (v.key.isShadow()) continue;
+			for (GraphicsProgram[] arr : v.variants.values()) for (GraphicsProgram gp : arr) if (gp != null) {
+				check.accept(v.name, v.layout, gp.spec().spirv());
+				break;
+			}
+		}
+		if (shadowSamplerUsers.isEmpty()) {
+			shadowUnused = true;
+			notes.add("shadow pass not run: shadow.enabled isn't set and no non-shadow program samples a shadow map (Iris creates no shadow targets either)");
+		}
+	}
+
+	private interface ShadowUseCheck {
+		void accept(String name, ShaderResourceLayout layout, List<byte[]> spirv);
+	}
+
+	/** Non-shadow programs that read a shadow sampler (why the shadow pass runs when shadow.enabled isn't set). */
+	List<String> shadowSamplerUsers() {
+		return shadowSamplerUsers;
 	}
 
 	private void buildAll(ShaderCompiler compiler, int width, int height, DeferredDestroyer destroyer) {
@@ -2527,7 +2592,7 @@ final class PostChain implements AutoCloseable {
 
 	/** True when the shadow terrain programs were built: the caller must then drive {@link #beginShadow} / {@link #endShadow}. */
 	boolean hasShadowPass() {
-		return shadowPass && shadowTerrain[0] != null;
+		return shadowPass && !shadowUnused && shadowTerrain[0] != null;
 	}
 
 	int shadowResolution() {

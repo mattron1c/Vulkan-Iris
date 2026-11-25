@@ -216,6 +216,7 @@ tasks.register<net.fabricmc.loom.task.prod.ClientProductionRunTask>("prodBenchGl
     System.getProperty("vulkaniris.phase6.packs")?.let { jvmArgs.add("-Dvulkaniris.phase6.packs=$it") }
     System.getProperty("vulkaniris.bench.seconds")?.let { jvmArgs.add("-Dvulkaniris.bench.seconds=$it") }
     System.getProperty("vulkaniris.bench.warmup")?.let { jvmArgs.add("-Dvulkaniris.bench.warmup=$it") }
+    System.getProperty("vulkaniris.gputime")?.let { jvmArgs.add("-Dvulkaniris.gputime=$it") }
     System.getProperty("vulkaniris.bench.gclog")?.let { jvmArgs.add("-Xlog:gc:file=$it") }
         // extra JVM flags for a bench run, e.g. -Dvulkaniris.bench.jvm="-XX:+UseZGC -XX:+ZGenerational"
         System.getProperty("vulkaniris.bench.jvm")?.let { jvmArgs.addAll(it.split(" ").filter(String::isNotBlank)) }

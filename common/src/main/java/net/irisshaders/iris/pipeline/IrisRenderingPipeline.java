@@ -872,6 +872,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 	@Override
 	public void beginLevelRendering() {
 		isRenderingWorld = true;
+		GlStageTimer.frameStart();
 
 		if (!initializedBlockIds) {
 			WorldRenderingSettings.INSTANCE.setBlockStateIds(
@@ -1018,6 +1019,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		}
 
 		beginRenderer.renderAll();
+		GlStageTimer.mark("begin end");
 
 		isBeforeTranslucent = true;
 	}
@@ -1025,10 +1027,14 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 	@Override
 	public void renderShadows(LevelRendererAccessor worldRenderer, Camera playerCamera, CameraRenderState renderState) {
 		if (shadowRenderer != null) {
+			GlStageTimer.mark("shadow start");
 			this.shadowRenderer.renderShadows(worldRenderer, playerCamera, renderState);
+			GlStageTimer.mark("shadow end");
 		}
 
+		GlStageTimer.mark("prepare start");
 		prepareRenderer.renderAll();
+		GlStageTimer.mark("prepare end");
 	}
 
 	@Override
@@ -1063,12 +1069,14 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		removePhaseIfNeeded();
 
 		isBeforeTranslucent = false;
+		GlStageTimer.mark("deferred start");
 
 		// We need to copy the current depth texture so that depthtex1 can contain the depth values for
 		// all non-translucent content, as required.
 		renderTargets.copyPreTranslucentDepth();
 
 		deferredRenderer.renderAll();
+		GlStageTimer.mark("deferred end");
 
 		// note: we are careful not to touch the lightmap texture unit or overlay color texture unit here,
 		// so we don't need to do anything to restore them if needed.
@@ -1086,8 +1094,11 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 	public void finalizeLevelRendering() {
 		isRenderingWorld = false;
 		removePhaseIfNeeded();
+		GlStageTimer.mark("composite start");
 		compositeRenderer.renderAll();
 		finalPassRenderer.renderFinalPass();
+		GlStageTimer.mark("final end");
+		GlStageTimer.frameEnd();
 	}
 
 	@Override

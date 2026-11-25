@@ -21,10 +21,17 @@ public final class ComputeProgram implements AutoCloseable {
 	private final long setLayout;
 	private final long layout;
 	private final long pipeline;
+	private final byte[] spirv;
+
+	/** The module this program was built from (e.g. for {@link SpirvUse}). */
+	public byte[] spirv() {
+		return spirv;
+	}
 
 	public ComputeProgram(VkDevice device, String name, byte[] spirv, List<GraphicsProgram.Binding> bindings) {
 		this.device = device;
 		this.name = name;
+		this.spirv = spirv;
 		long sl = 0, pl = 0, module = 0;
 		try (MemoryStack stack = stackPush()) {
 			LongBuffer lp = stack.mallocLong(1);

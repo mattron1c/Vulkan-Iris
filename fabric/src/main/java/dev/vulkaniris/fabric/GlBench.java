@@ -77,9 +77,13 @@ public final class GlBench {
 			if (bench == null) return;
 			packFrames++;
 			if (packFrames == REBUILD_FRAMES) bench.warmUp();
+			boolean wasMeasuring = bench.measuring();
 			if (bench.frame()) {
 				line("bench: " + bench.result());
+				if (net.irisshaders.iris.pipeline.GlStageTimer.ENABLED && packIndex >= 0) line("  GPU stages: " + net.irisshaders.iris.pipeline.GlStageTimer.report());
 				nextPack();
+			} else if (!wasMeasuring && bench.measuring()) {
+				net.irisshaders.iris.pipeline.GlStageTimer.reset();
 			}
 		} catch (Throwable t) {
 			Iris.logger.error("[Vulkan Iris] GL bench crashed", t);

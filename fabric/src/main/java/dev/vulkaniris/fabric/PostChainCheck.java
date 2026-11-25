@@ -423,6 +423,7 @@ public final class PostChainCheck {
 			line("  hand passes (pre-hand depth copy + solid hand): " + handPasses);
 			line("  derived at_tangent / mc_midTexCoord: " + chain.derivedDraws() + " draws computed them per quad in the vertex shader");
 			chain.derivedSkipped().forEach(x -> line("    not derived (GL default): " + x));
+			if (!chain.shadowSamplerUsers().isEmpty()) line("  shadow pass runs (shadow.enabled not set) because non-shadow programs read: " + chain.shadowSamplerUsers());
 			if (chain.hasShadowPass()) {
 				line("shadow: " + shadowPasses + " shadow passes (" + chain.shadowResolution() + "x" + chain.shadowResolution() + "), "
 					+ shadowTerrainPasses + " shadow terrain passes drawn with the pack's shadow programs; culling: " + shadowCulling);

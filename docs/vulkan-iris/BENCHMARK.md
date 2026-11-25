@@ -30,8 +30,7 @@ No performance claim about Vulkan Iris is made without these numbers. Where Vulk
 - **Diagnostics:** `-Dvulkaniris.bench.gclog=<file>` (GC log), `-Dvulkaniris.bench.jvm="<flags>"` (extra JVM flags, e.g. JFR or
   another GC). The report also says how many pipelines were built on first use while measuring (0 in the packs checked).
 - **GPU time per stage, B only:** `-Dvulkaniris.gputime=true` (see [GPU time per stage](#gpu-time-per-stage-b-only)).
-- **Not measured yet:** GPU time per stage on GL (`GL_TIME_ELAPSED` around Iris's stages). Without it, the stage
-  times can't be set against A's.
+- **GPU time per stage on GL:** the same flag on `prodBenchGl` (`GlStageTimer` in Iris's pipeline).
 - Packs run one after another in one game session per side, in the same order. A and B never run at the same time.
 
 ## Results — 2026-11-24, NVIDIA RTX 5060 (driver 610.88), after the frame-spike fix
@@ -117,10 +116,59 @@ shadow pass); they are left out below. Times in ms per frame. RTX 5060, 854×480
   Noble (37 %).
   - Noble's deferred stage takes 2.65 ms, 44 % of its frame.
   - BSL's translucent pass takes 0.67 ms, more than its deferred and composite stages together.
-- **Not known yet: whether any stage is slower than Iris's on GL.** That needs the same split on A.
+- **Against A:** see [GPU time per stage: A against B](#gpu-time-per-stage-a-against-b).
 - **This run was slower than the untimed one** by 3–14 % average FPS (Noble 191 → 164; it also had one 144 ms frame).
   - It isn't known whether that is the timestamps' cost or run-to-run variance.
   - So the timing is opt-in, and the FPS table above comes from runs without it.
+
+## GPU time per stage: A against B
+The same marks on GL: `GlStageTimer` writes `glQueryCounter(GL_TIMESTAMP)` at the same boundaries of Iris's own
+pipeline (`IrisRenderingPipeline`): `beginLevelRendering`, `renderShadows`, `beginTranslucents` and
+`finalizeLevelRendering`. Run `gradlew :fabric:prodBenchGl -Dvulkaniris.gputime=true`. Every frame was timed on both
+sides (none skipped). Each cell is A / B in ms per frame.
+
+| pack | GPU frame | begin | shadow pass | opaque world | deferred | translucent + hand | composite + final |
+|---|---|---|---|---|---|---|---|
+| Bliss | 2.24 / 2.12 | 0.07 / 0.01 | 0.62 / 0.50 | 0.54 / 0.67 | 0.23 / 0.23 | 0.09 / 0.12 | 0.68 / 0.57 |
+| BSL | 2.33 / 2.70 | 0.07 / 0.01 | 0.98 / 0.80 | 0.69 / 0.91 | 0.12 / 0.10 | 0.14 / 0.67 | 0.32 / 0.19 |
+| Complementary Reimagined | 2.30 / 2.80 | 0.08 / 0.02 | 0.77 / 0.77 | 0.83 / 1.28 | 0.14 / 0.11 | 0.09 / 0.30 | 0.40 / 0.31 |
+| Complementary Unbound | 2.29 / 3.00 | 0.08 / 0.02 | 0.78 / 0.85 | 0.80 / 1.28 | 0.14 / 0.10 | 0.09 / 0.43 | 0.39 / 0.31 |
+| MakeUp UltraFast | 1.21 / 1.23 | 0.01 / 0.00 | 0.25 / 0.27 | 0.58 / 0.59 | 0.07 / 0.06 | 0.08 / 0.14 | 0.20 / 0.16 |
+| Mellow | 0.71 / 0.81 | 0.02 / 0.00 | — / 0.18 | 0.49 / 0.45 | 0.03 / 0.02 | 0.07 / 0.09 | 0.10 / 0.06 |
+| miniature | 0.89 / 0.82 | 0.04 / 0.01 | 0.21 / 0.19 | 0.52 / 0.50 | 0.01 / 0.01 | 0.09 / 0.11 | 0.01 / 0.01 |
+| Noble | 3.63 / 6.03 | 0.24 / 0.03 | 1.42 / 1.46 | 0.58 / 0.79 | 0.65 / 2.65 | 0.12 / 0.23 | 0.58 / 0.84 |
+| Sildur's Vibrant Extreme | 2.48 / 2.41 | 0.09 / 0.01 | 1.30 / 1.11 | 0.57 / 0.61 | 0.28 / 0.24 | 0.10 / 0.27 | 0.14 / 0.16 |
+| Solas | 2.85 / 3.23 | 0.11 / 0.07 | 0.93 / 0.82 | 0.99 / 1.51 | 0.32 / 0.20 | 0.09 / 0.32 | 0.40 / 0.24 |
+
+Where B loses GPU time against A:
+- **Noble's deferred stage: 2.65 against 0.65 ms.** That is +2.0 ms, all of Noble's gap (GPU frame 6.03 against 3.63 ms).
+- **The translucent pass, in every pack:** 0.07–0.14 ms on A against 0.09–0.67 ms on B. The gap is largest in BSL
+  (+0.53 ms), Complementary Unbound (+0.34) and Complementary Reimagined (+0.22), Solas (+0.22) and Sildur's (+0.18).
+- **The opaque world, in most packs:** Solas +0.52 ms, Complementary +0.45–0.48 ms, BSL +0.22 ms, Noble +0.21 ms,
+  Bliss +0.13 ms. This is Polydium and Sodium drawing with the pack's gbuffers programs, plus Vulkan Iris's per-draw
+  work (descriptor writes, push constants and its per-quad derived attributes).
+- **Mellow ran a shadow pass that Iris doesn't (0.18 ms).** Fixed, see below.
+
+B is at or below A in the begin stage in every pack. It is also at or below A in the shadow pass, except
+Complementary Unbound (+0.06 ms), Noble (+0.04) and MakeUp (+0.01). In composite + final it is at or below A
+except Noble (+0.25) and Sildur's (+0.02).
+
+### Fixed: a shadow pass Iris doesn't run (Mellow)
+- Iris creates its shadow targets, and so a `ShadowRenderer`, only in two cases. Otherwise a pack's shadow programs
+  never run.
+  - `shadow.enabled` is true.
+  - A non-shadow program has an *active* shadow sampler: `IrisSamplers.hasShadowSamplers`, asked of the linked GL
+    program.
+- Vulkan Iris ran the shadow pass whenever the pack had a shadow program.
+- Mellow (default options) has `shadow.fsh`, and its `gbuffers_terrain` declares `shadowtex0`, but no code reads it.
+  So GL drops the sampler, and Iris draws no shadows.
+- **Fix:**
+  - `PostChain.decideShadowPass` applies Iris's rule.
+  - "Active" comes from the SPIR-V: `SpirvUse` reports the bindings that any instruction reads.
+  - It's unit-tested in `SpirvUseTest`, with and without optimisation.
+- **Result:** Mellow now has no shadow pass, as on GL. The other 9 packs keep theirs, as on GL. The report names the
+  programs and samplers that keep each pack's shadow pass on. prodPhase7 11/11, prodPhase6 10/10.
+- The FPS tables above were measured before this fix, so Mellow's B numbers include that extra shadow pass.
 
 ## Frame-time spikes: found and fixed
 The first run (below) had a 20–68 ms frame every 2–3 s on B, in every pack, and none in the no-pack control.
