@@ -58,6 +58,10 @@ public final class VanillaHook {
 		/** Ends Vulkan Iris's rendering scope before Polydium resumes. */
 		void end(VkCommandBuffer cmd);
 
+		/** A GPU timestamp mark (-Dvulkaniris.gputime=passes), outside any rendering scope. */
+		default void gpuMark(VkCommandBuffer cmd, String name) {
+		}
+
 		void failed(Throwable t);
 
 		/**
@@ -238,6 +242,7 @@ public final class VanillaHook {
 			if (!cur.suspended) {
 				GraphicsProgram.endRendering(cmd);
 				PolydiumAccess.polydiumBarrier(cmd);
+				if (GpuTimer.PER_PASS) s.gpuMark(cmd, "pack draws: " + info.getLocation().getPath());
 				cur.suspended = true;
 			}
 			s.draw(cmd, key, info, new State(uniforms, textures, outW, outH, cur.scissor, vertexSource(cur)), hasDepth, indexed, a, b, c, d, e);

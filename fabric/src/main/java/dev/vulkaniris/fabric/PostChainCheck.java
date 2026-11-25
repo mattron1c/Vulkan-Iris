@@ -602,6 +602,11 @@ public final class PostChainCheck {
 		}
 
 		@Override
+		public void gpuMark(VkCommandBuffer cmd, String name) {
+			if (chain != null) chain.gpuMarkAt(cmd, name);
+		}
+
+		@Override
 		public boolean dropUnhandled() {
 			return ShadowRenderingState.areShadowsCurrentlyBeingRendered();
 		}

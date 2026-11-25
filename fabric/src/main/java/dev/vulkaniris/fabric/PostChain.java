@@ -2277,6 +2277,11 @@ final class PostChain implements AutoCloseable {
 		if (gpuTimer != null) gpuTimer.mark(cmd, name);
 	}
 
+	/** A GPU mark from outside a segment (VanillaHook, between Polydium's scope and the pack's). */
+	void gpuMarkAt(VkCommandBuffer cmd, String name) {
+		if (gpuTimer != null && levelBegun) gpuTimer.mark(cmd, name);
+	}
+
 	/**
 	 * Records the whole chain. {@code mainColor} holds the vanilla frame on entry and the pack's final output on exit.
 	 * Returns false (recording nothing) if a uniform slot is still in use by an unfinished submission.
@@ -2409,6 +2414,7 @@ final class PostChain implements AutoCloseable {
 		if (!levelBegun) throw new IllegalStateException("beforeHand outside the level");
 		if (depthNoHand == null) return;
 		segment(cmd, tracker);
+		if (GpuTimer.PER_PASS) gpuMark("hand start");
 		copyDepth(mainDepth, depthNoHand);
 		handCopied = true;
 		endSegment();
@@ -2537,7 +2543,9 @@ final class PostChain implements AutoCloseable {
 		Gbuffer g = terrain[kind];
 		GpuImage[] outs = new GpuImage[g.drawBuffers.length];
 		for (int i = 0; i < outs.length; i++) outs[i] = targets.read(g.drawBuffers[i]);
+		if (GpuTimer.PER_PASS) gpuMark("terrain " + g.name + " start");
 		drawRegions(g, outs, mainDepthAttachment, draws);
+		if (GpuTimer.PER_PASS) gpuMark("terrain " + g.name + " end");
 		endSegment();
 	}
 
