@@ -322,4 +322,13 @@ The table comes from the 3-pack run.
 
 ## Found, not caused by 7d
 - **Noble's translucent hand is black.** The light-blue glass in the off hand renders black, with or without shadow draws.
-  It comes from the 7c-gaps hand pass, and is listed for the 7e correctness sweep.
+  **Diagnosed (7e):** not the hand pass. Noble's forward program (`programs/gbuffers/forward.glsl`, used by
+  `gbuffers_hand_water`) builds its TBN from `at_tangent`. Iris supplies that through its extended entity vertex
+  format, which isn't ported (see "Entity IDs"), so here the attribute reads GL's default (0,0,0,1) and
+  `normalize(gl_NormalMatrix * vec3(0))` is NaN. Iris's default normal texel (127,127,255,255) passes Noble's
+  `> EPS` normal-map test, the NaN reaches the lighting, and the fragment comes out black. To check, a local
+  diagnostic run (not committed) fed (1,0,0,1) instead: the glass rendered light blue, and Noble's chests and
+  entities came out brighter too, so they are also darkened today. The fix is the extended entity attributes:
+  Iris derives `at_tangent` and `mc_midTexCoord` per quad from the vertices (`NormalHelper.computeTangent`,
+  the quad's mean UV), so they can be derived on Vulkan without widening Polydium's vertex buffers;
+  `mc_Entity` / `iris_Entity` can't.
