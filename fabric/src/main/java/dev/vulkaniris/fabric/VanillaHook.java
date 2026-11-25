@@ -59,6 +59,14 @@ public final class VanillaHook {
 		void end(VkCommandBuffer cmd);
 
 		void failed(Throwable t);
+
+		/**
+		 * True when a draw with no pack program must be skipped instead of left to Polydium: in the shadow pass the
+		 * geometry is in the shadow view, and Polydium would draw it into the main target.
+		 */
+		default boolean dropUnhandled() {
+			return false;
+		}
 	}
 
 	/** Result of {@link #draw}: Polydium's draw call goes ahead untouched. */
@@ -195,7 +203,10 @@ public final class VanillaHook {
 		if (!tracked || pipeline == null) return PASS;
 		RenderPipeline info = original(pipeline.info());
 		ShaderKey key = s == null || !s.active() ? null : s.key(info);
-		if (key == null) return resume(pass, cmd, pipeline, hasDepth) ? RESUMED : PASS;
+		if (key == null) {
+			if (s != null && s.active() && s.dropUnhandled()) return HANDLED;
+			return resume(pass, cmd, pipeline, hasDepth) ? RESUMED : PASS;
+		}
 		try {
 			if (!cur.suspended) {
 				GraphicsProgram.endRendering(cmd);

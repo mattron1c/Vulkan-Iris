@@ -177,6 +177,7 @@ fun registerProdSelfTest(name: String, flag: String) =
         System.getProperty("vulkaniris.phase6.packs")?.let { jvmArgs.add("-Dvulkaniris.phase6.packs=$it") }
         // A/B: gradlew :fabric:prodPhase7 -Dvulkaniris.phase7.noshadow=true skips the shadow draws
         System.getProperty("vulkaniris.phase7.noshadow")?.let { jvmArgs.add("-Dvulkaniris.phase7.noshadow=$it") }
+        System.getProperty("vulkaniris.phase7.noentityshadow")?.let { jvmArgs.add("-Dvulkaniris.phase7.noentityshadow=$it") }
         runDir.set(project.layout.projectDirectory.dir("run-prod"))
     }
 

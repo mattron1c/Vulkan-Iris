@@ -262,8 +262,8 @@ nothing occludes and the trunk and ground under the tree are lit. With the shado
   reports a Vulkan pack (`vulkanPackInUse`). Without that, the camera-based culler would have filtered the shadow view's sections too.
 
 ## Limits (all reported in the notes)
-- only terrain is drawn into the shadow map: entities, block entities and the player don't cast shadows yet
-  (Iris's shadow pass draws them with `shadow_entities` / `shadow_block`)
+- ~~only terrain is drawn into the shadow map~~: entities and block entities followed, see
+  [7d entity shadows](#7d-entity-shadows) below
 - fragment `shadowcomp` programs and `shadow.csh` are reported, not run (none of the 10 packs has them)
 - shadow mipmaps (`shadowtex0Mipmap` etc.), `shadowtex0HW` / `shadowtex1HW` (separate hardware samplers) and
   `shadowcolorimgN` storage images are not done
@@ -271,6 +271,54 @@ nothing occludes and the trunk and ground under the tree are lit. With the shado
 - a `sampler2D` on a shadow map with `shadowHardwareFiltering` set is undefined on GL; here the GLSL type decides
   (no compare), and the notes say so (Complementary, Bliss)
 - the shadow pass is redrawn every frame, as Iris does
+
+## 7d entity shadows
+
+**Result:** entities, block entities and the player now cast shadows. Iris draws them into the shadow map between the
+opaque and translucent shadow terrain, and Vulkan Iris now does the same, with the pack's shadow entity programs.
+`prodPhase7` passes 10 / 10 (see the run below), and `prodPhase6` still passes 10 / 10.
+
+The proof is on the GPU, not in a screenshot. Mob positions, wind and clouds differ from run to run, so an image diff
+between two runs can't isolate a shadow. Instead, on shadow pass 200 the test reads `shadowtex0` back twice, just
+before and just after the entity draws, and counts the texels they changed:
+
+| pack | texels written by entity draws | of them nearer to the light | covered by terrain before |
+|---|---|---|---|
+| BSL | 6 468 of 4.19 M (2048²) | 6 468 | 1.66 M |
+| Complementary Reimagined (entity shadow distance 24 blocks) | 2 578 of 4.19 M | 2 578 | 1.67 M |
+| Noble | 24 896 of 9.44 M (3072²) | 24 896 | 4.65 M |
+
+Every changed texel got nearer to the light, which is what depth-tested casters have to do.
+In the full 10-pack run every pack's probe found entity-written texels (163 to 40 985), all of them nearer to the light.
+The table comes from the 3-pack run.
+
+### How it works
+- **CPU.** `VulkanShadow` ports the entity half of Iris's `ShadowRenderer.renderShadows` (LGPL-3.0, credit: the Iris
+  team):
+  - `extractVisibleEntities` (or only the player and its vehicle when the pack sets `shadowEntities=false`, `shadowPlayer=true`)
+  - the entity frustum: the terrain one, or a separate one when `entityShadowDistanceMul` is set
+  - block entity extraction (with the light-emitting-only filter), via a new `LevelRendererAccessorPort` invoker
+  - submission with the shadow model-view into the pass's own `SubmitNodeStorage`, `RenderBuffers` and `FeatureRenderDispatcher`
+  - drawing with the model-view stack at identity and the shadow projection set
+- **Sodium.** The port of Iris's `MixinSodiumWorldRenderer` now also has its `isEntityVisible` skip in the shadow pass.
+- **GPU.** The entity draws reach Polydium render passes on the main target, and `VanillaHook` takes them as it does in
+  the main pass. With Iris's shadow state set, `IrisPipelines.getPipeline` returns the shadow keys (`SHADOW_ENTITIES_CUTOUT`,
+  `SHADOW_BLOCK`, ...). `PostChain` now builds those like Iris's `createShadowShader`:
+  - draw buffers: unknown = {0, 1} into `shadowcolorN`, and depth goes to `shadowtex0`
+  - glint input off
+  - Iris's synthesized fallback (shadowcolor0, blend off) when the chain has no program
+  - drawn over the whole shadow map's viewport
+  - `iris_ProjMatInverse` is the shadow projection's inverse, as in `ExtendedShader`
+- **Skipped draws.** In the shadow pass, a draw with no shadow program is skipped (`Sink.dropUnhandled`), not handed
+  back to Polydium, which would draw shadow-view geometry into the main target. The report lists them. In the 10 packs
+  that is only vanilla's round `entity_shadow` blob, which Iris doesn't map in the shadow pass either.
+- **A/B switch.** `-Dvulkaniris.phase7.noentityshadow=true` draws terrain-only shadows.
+
+### Limits
+- entity attributes (`iris_Entity`, `mc_Entity`, `mc_midTexCoord`, `at_midBlock`) read GL's default (0,0,0,1) here
+  as in the main pass, because Iris's extended entity vertex format isn't ported (see "Entity IDs" above)
+- the glowing-entity outline buffer of the shadow pass isn't redirected: such passes aren't on the main target, so
+  Polydium draws them as vanilla into the outline target (not checked against Iris on GL; the test scene has no glowing entities)
 
 ## Found, not caused by 7d
 - **Noble's translucent hand is black.** The light-blue glass in the off hand renders black, with or without shadow draws.

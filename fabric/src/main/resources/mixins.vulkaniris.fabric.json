@@ -8,6 +8,7 @@
   "client": [
     "GameRendererAccessorPort",
     "GlBufferArenaAccessorPort",
+    "LevelRendererAccessorPort",
     "MixinAbstractBlockRenderContextPort",
     "MixinBiomeAmbientSoundsHandlerPort",
     "MixinBiomePort",

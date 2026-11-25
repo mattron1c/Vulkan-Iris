@@ -7,9 +7,12 @@ import dev.vulkaniris.fabric.PostChainCheck;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.state.LevelRenderState;
 import org.joml.Matrix4f;
 import org.joml.Vector4f;
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -17,6 +20,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /** Same injection point and signature as Iris's MixinLevelRenderer#iris$setupPipeline (stripped by Polydium on Vulkan). */
 @Mixin(LevelRenderer.class)
 public class MixinLevelRendererVulkan {
+	@Shadow
+	@Final
+	private LevelRenderState levelRenderState;
+
 	@Inject(method = "renderLevel", at = @At("HEAD"))
 	private void vulkaniris$beginLevel(GraphicsResourceAllocator allocator, DeltaTracker deltaTracker, boolean bl, Camera camera, Matrix4f modelView,
 									   Matrix4f projection, Matrix4f matrix4f3, GpuBufferSlice fog, Vector4f vector4f, boolean bl2, CallbackInfo ci) {
@@ -29,7 +36,7 @@ public class MixinLevelRendererVulkan {
 		target = "Lnet/minecraft/client/renderer/LevelRenderer;prepareCullFrustum(Lorg/joml/Matrix4f;Lorg/joml/Matrix4f;Lnet/minecraft/world/phys/Vec3;)Lnet/minecraft/client/renderer/culling/Frustum;"))
 	private void vulkaniris$shadows(GraphicsResourceAllocator allocator, DeltaTracker deltaTracker, boolean bl, Camera camera, Matrix4f modelView,
 									Matrix4f projection, Matrix4f matrix4f3, GpuBufferSlice fog, Vector4f vector4f, boolean bl2, CallbackInfo ci) {
-		PostChainCheck.afterCullFrustum(camera);
+		PostChainCheck.afterCullFrustum(camera, levelRenderState.cameraRenderState);
 	}
 
 	@Inject(method = "renderLevel", at = @At("RETURN"))

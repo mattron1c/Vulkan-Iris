@@ -9,6 +9,7 @@ import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import net.irisshaders.iris.gl.state.ShaderAttributeInputs;
 import net.irisshaders.iris.pipeline.IrisPipelines;
+import net.irisshaders.iris.shadows.ShadowRenderingState;
 import net.irisshaders.iris.pipeline.fallback.ShaderSynthesizer;
 import net.irisshaders.iris.pipeline.programs.ShaderKey;
 import net.irisshaders.iris.uniforms.VanillaUniforms;
@@ -965,6 +966,8 @@ final class PostChain implements AutoCloseable {
 	/** One pack program for an Iris ShaderKey; pipelines are made per vanilla RenderPipeline it replaces (vanilla's state, the pack's shaders). */
 	private static final class Vanilla {
 		ShaderKey key;
+		/** A shadow-pass key (Iris IrisPipelines' shadow map): draws into shadowcolorN and shadowtex0. */
+		boolean shadow;
 		String name;
 		ShaderResourceLayout layout;
 		List<Bound> bounds = new ArrayList<>();
@@ -995,6 +998,7 @@ final class PostChain implements AutoCloseable {
 	private GpuBuffer constantAttributes;
 	private GpuImage[] vanillaOuts;
 	private boolean vanillaOpen, vanillaOpenDepth;
+	private GpuImage vanillaOpenDepthImage;
 	private final Set<String> unmappedPipelines = new TreeSet<>();
 
 	/** Iris ShaderCreator.create's uniforms (CommonUniforms PER_VERTEX, custom, builtin replacements, VanillaUniforms) and ExtendedShader's matrices. */
@@ -1018,7 +1022,8 @@ final class PostChain implements AutoCloseable {
 			for (int i = 0; i < 9; i++) d[i] = f[i];
 			return d;
 		});
-		vanillaWriter.override("iris_ProjMatInverse", () -> mat4(new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferProjection()).invert()));
+		vanillaWriter.override("iris_ProjMatInverse", () -> mat4(new Matrix4f(ShadowRenderingState.areShadowsCurrentlyBeingRendered()
+			? shadowProjection : CapturedRenderingState.INSTANCE.getGbufferProjection()).invert()));
 		// FallbackShader's own uniforms: the key's alpha reference (set per program before its uniforms are written) and fog
 		vanillaWriter.override("AlphaTestValue", () -> new double[]{CapturedRenderingState.INSTANCE.getCurrentAlphaTest()});
 		vanillaWriter.override("FogDensity", () -> new double[]{Math.max(0f, CapturedRenderingState.INSTANCE.getFogDensity())});
@@ -1045,7 +1050,8 @@ final class PostChain implements AutoCloseable {
 	private void buildVanilla(ShaderCompiler compiler, Set<Integer> used) {
 		ProgramFallbackResolver resolver = new ProgramFallbackResolver(set);
 		for (ShaderKey key : ShaderKey.values()) {
-			if (!isVanillaKey(key)) continue;
+			// Iris IrisRenderingPipeline: shadow keys get createShadowShader when the pack has a shadow pass
+			if (key.isShadow() ? !shadowPass || key == ShaderKey.IE_COMPAT_SHADOW : !isVanillaKey(key)) continue;
 			Optional<ProgramSource> found = resolver.resolve(key.getProgram());
 			if (found.isEmpty()) {
 				try {
@@ -1081,6 +1087,7 @@ final class PostChain implements AutoCloseable {
 	private Vanilla buildFallbackProgram(ShaderCompiler compiler, ShaderKey key, Set<Integer> used) {
 		Vanilla v = new Vanilla();
 		v.key = key;
+		v.shadow = key.isShadow();
 		v.name = "fallback (" + key.getName() + ")";
 		v.alphaTest = key.getAlphaTest().reference();
 		ShaderAttributeInputs inputs = new ShaderAttributeInputs(key.getVertexFormat(), key.shouldIgnoreLightmap(), false, key == ShaderKey.GLINT,
@@ -1100,7 +1107,8 @@ final class PostChain implements AutoCloseable {
 		v.attributes = vk.attributes();
 		for (String u : vanillaWriter.unresolved(v.layout)) notes.add(v.name + ": uniform " + u + " has no Vulkan value yet (zero)");
 		v.drawBuffers = new int[]{0};
-		used.add(0);
+		if (v.shadow) v.blendOverride = Optional.of(BlendModeOverride.OFF);
+		else used.add(0);
 		v.stages = new ArrayList<>();
 		v.spirv = new ArrayList<>();
 		for (var e : vk.sources().entrySet()) {
@@ -1130,21 +1138,24 @@ final class PostChain implements AutoCloseable {
 		}
 		Vanilla v = new Vanilla();
 		v.key = key;
+		v.shadow = key.isShadow();
 		v.name = src.getName() + " (" + key.getName() + ")";
 		var d = src.getDirectives();
 		AlphaTest alpha = d.getAlphaTestOverride().orElse(key.getAlphaTest());
 		v.alphaTest = alpha.reference();
 		boolean isLines = key.getProgram() == ProgramId.Line && resolver.has(ProgramId.Line);
-		ShaderAttributeInputs inputs = new ShaderAttributeInputs(key.getVertexFormat(), key.shouldIgnoreLightmap(), isLines, key.isGlint(), key.isText(),
-			key == ShaderKey.IE_COMPAT);
+		// IrisRenderingPipeline.createShadowShader passes isGlint = false
+		ShaderAttributeInputs inputs = new ShaderAttributeInputs(key.getVertexFormat(), key.shouldIgnoreLightmap(), isLines, !v.shadow && key.isGlint(),
+			key.isText(), key == ShaderKey.IE_COMPAT);
 		Map<PatchShaderType, String> gl = TransformPatcher.patchVanilla(v.name, src.getVertexSource().orElseThrow(), src.getGeometrySource().orElse(null),
 			null, null, src.getFragmentSource().orElseThrow(), alpha, isLines, key == ShaderKey.CLOUDS, true, inputs, directives.getTextureMap());
 		var vk = VulkanGlslTranslator.translate(gl, vanillaWriter::provides);
 		v.layout = vk.layout();
 		v.attributes = vk.attributes();
 		for (String u : vanillaWriter.unresolved(v.layout)) notes.add(v.name + ": uniform " + u + " has no Vulkan value yet (zero)");
-		v.drawBuffers = d.getDrawBuffers();
-		for (int b : v.drawBuffers) used.add(b);
+		// ShaderCreator.createShadow: unknown draw buffers = {0, 1} in the shadow framebuffer
+		v.drawBuffers = v.shadow && d.hasUnknownDrawBuffers() ? new int[]{0, 1} : d.getDrawBuffers();
+		if (!v.shadow) for (int b : v.drawBuffers) used.add(b);
 		v.stages = new ArrayList<>();
 		v.spirv = new ArrayList<>();
 		for (var e : vk.sources().entrySet()) {
@@ -1185,12 +1196,19 @@ final class PostChain implements AutoCloseable {
 	/** The pack program Iris would draw this vanilla pipeline with, or null (then Polydium draws it as vanilla). */
 	ShaderKey vanillaKey(RenderPipeline pipeline) {
 		ShaderKey key = IrisPipelines.getPipeline(null, pipeline);
+		if (ShadowRenderingState.areShadowsCurrentlyBeingRendered() && (key == null || !vanilla.containsKey(key))) {
+			shadowDropped.add(pipeline.getLocation() + (key == null ? " (no shadow mapping in Iris)" : " (" + key.getName() + ": " + vanillaFailures.get(key) + ")"));
+			return null;
+		}
 		if (key == null) {
 			unmappedPipelines.add(pipeline.getLocation().toString());
 			return null;
 		}
 		return vanilla.containsKey(key) ? key : null;
 	}
+
+	/** Pipelines drawn in the shadow pass that Vulkan Iris has no shadow program for; they are skipped. */
+	final Set<String> shadowDropped = new TreeSet<>();
 
 	Set<String> unmappedPipelines() {
 		return unmappedPipelines;
@@ -1324,9 +1342,12 @@ final class PostChain implements AutoCloseable {
 			vkBlend(b.sourceAlpha().name()), vkBlend(b.destAlpha().name()))).orElse(null);
 		if (v.blendOverride.isPresent()) base = blend(v.blendOverride.get());
 		for (int k = 0; k < n; k++) {
-			colorFormats[k] = RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[v.drawBuffers[k]]));
+			colorFormats[k] = v.shadow ? shadowColorImage(v.drawBuffers[k]).format()
+				: RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[v.drawBuffers[k]]));
 			blends[k] = v.bufferBlends.containsKey(k) ? blend(v.bufferBlends.get(k)) : base;
-			if (blends[k] != null && VkFormats.isInteger(targetFormats[v.drawBuffers[k]])) {
+			boolean integer = v.shadow ? VkFormats.isInteger(shadowDirectives.getColorSamplingSettings().get(v.drawBuffers[k]).getFormat())
+				: VkFormats.isInteger(targetFormats[v.drawBuffers[k]]);
+			if (blends[k] != null && integer) {
 				// GL ignores blending for integer attachments; Vulkan forbids enabling it
 				blends[k] = null;
 			}
@@ -1335,7 +1356,7 @@ final class PostChain implements AutoCloseable {
 		if (p.getColorLogic() != com.mojang.blaze3d.platform.LogicOp.NONE) notes.add(p.getLocation() + ": colour logic op " + p.getColorLogic() + " ignored (not implemented yet)");
 		boolean test = depth && p.getDepthTestFunction() != DepthTestFunction.NO_DEPTH_TEST;
 		int mask = (p.isWriteColor() ? VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT : 0) | (p.isWriteAlpha() ? VK_COLOR_COMPONENT_A_BIT : 0);
-		var raster = new GraphicsProgram.Raster(depth ? mainDepthFormat : 0, test, depth && p.isWriteDepth(), depthCompare(p.getDepthTestFunction()),
+		var raster = new GraphicsProgram.Raster(depth ? (v.shadow ? VK_FORMAT_D32_SFLOAT : mainDepthFormat) : 0, test, depth && p.isWriteDepth(), depthCompare(p.getDepthTestFunction()),
 			p.isCull() ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE, 0, mask, p.getDepthBiasConstant(), p.getDepthBiasScaleFactor());
 		arr[i] = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec(v.name + " / " + p.getLocation(), v.stages, v.spirv, v.bindings, attributes,
 			format.getVertexSize(), topology(p.getVertexFormatMode()), colorFormats, blends, raster));
@@ -1351,14 +1372,19 @@ final class PostChain implements AutoCloseable {
 					 boolean indexed, int a, int b, int c, int d, int e) {
 		if (!levelBegun) throw new IllegalStateException("vanilla draw before beginLevel");
 		Vanilla v = vanilla.get(key);
+		if (v.shadow && !shadowBegun) throw new IllegalStateException(v.name + ": shadow draw outside beginShadow / endShadow");
 		this.cmd = cmd;
 		this.tracker = tracker;
 		this.currentDepth = mainDepth;
 		passState = st;
 		GpuImage[] outs = new GpuImage[v.drawBuffers.length];
-		for (int i = 0; i < outs.length; i++) outs[i] = targets.read(v.drawBuffers[i]);
+		for (int i = 0; i < outs.length; i++) outs[i] = v.shadow ? shadowColorImage(v.drawBuffers[i]) : targets.read(v.drawBuffers[i]);
+		GpuImage depthAttachment = v.shadow ? shadowDepthImage(0) : mainDepthAttachment;
 		Resolved r = new Resolved(v.bounds, mainDepth);
-		boolean sameTargets = vanillaOpen && vanillaOpenDepth == depth && Arrays.equals(outs, vanillaOuts);
+		if (depth && r.sampled.contains(depthAttachment)) {
+			throw new IllegalStateException(v.name + " samples " + depthAttachment.name() + " while drawing into it (not implemented yet)");
+		}
+		boolean sameTargets = vanillaOpen && vanillaOpenDepth == depth && vanillaOpenDepthImage == depthAttachment && Arrays.equals(outs, vanillaOuts);
 		for (GpuImage o : outs) {
 			if (r.storage.contains(o)) throw new IllegalStateException(v.name + " uses " + o.name() + " as a storage image and renders to it (not implemented)");
 			if (r.sampled.contains(o)) {
@@ -1381,12 +1407,13 @@ final class PostChain implements AutoCloseable {
 				vanillaOpen = false;
 			}
 			for (GpuImage o : outs) tracker.use(o, LayoutTracker.Use.COLOR_ATTACHMENT);
-			if (depth) tracker.use(mainDepthAttachment, LayoutTracker.Use.DEPTH_ATTACHMENT);
+			if (depth) tracker.use(depthAttachment, LayoutTracker.Use.DEPTH_ATTACHMENT);
 			tracker.flush(cmd);
 			if (v.usesSsbo) memoryBarrier();
-			GraphicsProgram.beginRendering(cmd, outs, depth ? mainDepthAttachment : null);
+			GraphicsProgram.beginRendering(cmd, outs, depth ? depthAttachment : null);
 			vanillaOpen = true;
 			vanillaOpenDepth = depth;
+			vanillaOpenDepthImage = depthAttachment;
 			vanillaOuts = outs;
 		}
 
@@ -1404,9 +1431,11 @@ final class PostChain implements AutoCloseable {
 		try (MemoryStack s = MemoryStack.stackPush()) {
 			if (v.usesConstants.get(pipeline)) vkCmdBindVertexBuffers(cmd, GraphicsProgram.CONSTANT_BINDING, s.longs(constantAttributes.buffer()), s.longs(0));
 			VkViewport.Buffer vp = VkViewport.calloc(1, s);
-			vp.get(0).width(st.viewportWidth()).height(st.viewportHeight()).maxDepth(1f);
+			// the shadow pass draws over the whole shadow map (Iris ShadowRenderer.setupShadowViewport)
+			int vw = v.shadow ? shadowResolution : st.viewportWidth(), vh = v.shadow ? shadowResolution : st.viewportHeight();
+			vp.get(0).width(vw).height(vh).maxDepth(1f);
 			vkCmdSetViewport(cmd, 0, vp);
-			int[] sc = st.scissor();
+			int[] sc = v.shadow ? new int[]{0, 0, shadowResolution, shadowResolution} : st.scissor();
 			VkRect2D.Buffer rect = VkRect2D.calloc(1, s);
 			rect.get(0).offset(o -> o.set(sc[0], sc[1])).extent(x -> x.set(sc[2], sc[3]));
 			vkCmdSetScissor(cmd, 0, rect);
@@ -2380,6 +2409,15 @@ final class PostChain implements AutoCloseable {
 		} finally {
 			shadowing = false;
 		}
+		endSegment();
+	}
+
+	/** Self-test: copies shadowtex0 (depth aspect) into {@code rb}, in the shadow pass, so the CPU can see what was drawn. */
+	void probeShadowDepth(VkCommandBuffer cmd, LayoutTracker tracker, dev.vulkaniris.vk.ImageReadback rb) {
+		if (!shadowBegun) throw new IllegalStateException("shadow depth probe outside the shadow pass");
+		segment(cmd, tracker);
+		tracker.use(shadowDepth, LayoutTracker.Use.TRANSFER_SRC).flush(cmd);
+		rb.record(cmd, shadowDepth.image(), shadowDepth.layout(), 0, 0, VK_IMAGE_ASPECT_DEPTH_BIT);
 		endSegment();
 	}
 

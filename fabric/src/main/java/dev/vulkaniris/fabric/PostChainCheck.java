@@ -3,6 +3,7 @@ package dev.vulkaniris.fabric;
 import net.irisshaders.iris.apiimpl.IrisApiV0Impl;
 import net.irisshaders.iris.shadows.ShadowRenderingState;
 import net.minecraft.client.Camera;
+import net.minecraft.client.renderer.state.CameraRenderState;
 import com.google.common.collect.ImmutableList;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.pipeline.RenderTarget;
@@ -380,6 +381,10 @@ public final class PostChainCheck {
 			if (chain.hasShadowPass()) {
 				line("shadow: " + shadowPasses + " shadow passes (" + chain.shadowResolution() + "x" + chain.shadowResolution() + "), "
 					+ shadowTerrainPasses + " shadow terrain passes drawn with the pack's shadow programs; culling: " + shadowCulling);
+				line("shadow entities: " + shadowEntities + " entity and " + shadowBlockEntities + " block entity submissions over "
+					+ shadowPasses + " shadow passes (entity culling: " + VulkanShadow.entityCulling + ")");
+				line("shadow entity probe (shadow pass " + PROBE_PASS + "): " + probeResult);
+				if (!chain.shadowDropped.isEmpty()) line("  note: shadow pass draws skipped (no shadow program): " + chain.shadowDropped);
 			} else {
 				line("shadow: no shadow pass for this pack");
 			}
@@ -457,6 +462,11 @@ public final class PostChainCheck {
 		VulkanHand.enabled = VANILLA_SINK::active;
 		shadowPasses = 0;
 		shadowTerrainPasses = 0;
+		shadowEntities = 0;
+		shadowBlockEntities = 0;
+		probeResult = "not run";
+		probeSubmit = -1;
+		probeBefore = probeAfter = null;
 		shadowFailed = false;
 		shadowCulling = "";
 		IrisApiV0Impl.vulkanPackInUse = true;
@@ -538,6 +548,11 @@ public final class PostChainCheck {
 		}
 
 		@Override
+		public boolean dropUnhandled() {
+			return ShadowRenderingState.areShadowsCurrentlyBeingRendered();
+		}
+
+		@Override
 		public void failed(Throwable t) {
 			vanillaFailed = true;
 			allPassed = false;
@@ -584,14 +599,57 @@ public final class PostChainCheck {
 
 	// ------------------------------------------------------------------ Phase 7d: shadow pass
 	private static boolean shadowActive, shadowFailed;
-	private static long shadowTerrainPasses, shadowPasses;
+	private static long shadowTerrainPasses, shadowPasses, shadowEntities, shadowBlockEntities;
+
+	// Self-test: shadowtex0 read back just before and just after the entity draws of one shadow pass
+	private static final int PROBE_PASS = 200;
+	private static ImageReadback probeBefore, probeAfter;
+	private static long probeSubmit = -1;
+	private static String probeResult = "not run";
+
+	private static void probe(boolean after) {
+		try {
+			int res = chain.shadowResolution();
+			ImageReadback rb = new ImageReadback(ctx.device(), ctx.capabilities(), res, res);
+			if (after) probeAfter = rb;
+			else probeBefore = rb;
+			VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
+			PolydiumAccess.polydiumBarrier(cmd);
+			chain.probeShadowDepth(cmd, tracker, rb);
+			PolydiumAccess.polydiumBarrier(cmd);
+			if (after) probeSubmit = PolydiumAccess.currentSubmitIndex();
+		} catch (Throwable t) {
+			probeResult = "probe failed: " + t;
+		}
+	}
+
+	/** Once the probed frame finished: how many shadow texels the entity draws wrote, and how many got nearer. */
+	private static void finishProbe() {
+		if (probeSubmit < 0 || !PolydiumAccess.submitCompleted(probeSubmit)) return;
+		probeSubmit = -1;
+		byte[] a = probeBefore.bytes(), b = probeAfter.bytes();
+		java.nio.FloatBuffer fa = java.nio.ByteBuffer.wrap(a).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer();
+		java.nio.FloatBuffer fb = java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer();
+		long changed = 0, nearer = 0, covered = 0;
+		for (int i = 0; i < fa.capacity(); i++) {
+			float x = fa.get(i), y = fb.get(i);
+			if (x < 1f) covered++;
+			if (x != y) changed++;
+			if (y < x) nearer++;
+		}
+		probeResult = changed + " of " + fa.capacity() + " shadowtex0 texels written by the entity draws (" + nearer + " nearer to the light; "
+			+ covered + " covered by opaque terrain before them)";
+		probeBefore.close();
+		probeAfter.close();
+		probeBefore = probeAfter = null;
+	}
 	private static String shadowCulling = "";
 
 	/**
 	 * LevelRenderer.renderLevel after prepareCullFrustum (Iris MixinLevelRenderer#iris$renderTerrainShadows): the shadow
 	 * pass, then the prepare stage, as IrisRenderingPipeline.renderShadows does.
 	 */
-	public static void afterCullFrustum(Camera camera) {
+	public static void afterCullFrustum(Camera camera, CameraRenderState cameraState) {
 		if (chain == null || !chain.hasTerrain() || !chain.levelBegun() || PolydiumAccess.inRenderPass()) return;
 		try {
 			// -Dvulkaniris.phase7.noshadow=true: A/B switch; the shadow maps then stay cleared (depth 1 = nothing occludes)
@@ -604,7 +662,14 @@ public final class PostChainCheck {
 				PolydiumAccess.polydiumBarrier(cmd);
 				shadowActive = true;
 				try {
-					VulkanShadow.drawTerrain(chain.directives(), view, camera, true);
+					finishProbe();
+					boolean probing = shadowPasses == PROBE_PASS && probeBefore == null;
+					VulkanShadow.beforeEntities = probing ? () -> probe(false) : null;
+					VulkanShadow.afterEntities = probing ? () -> probe(true) : null;
+					VulkanShadow.draw(chain.directives(), view, camera, cameraState, true);
+					VulkanShadow.beforeEntities = VulkanShadow.afterEntities = null;
+					shadowEntities += VulkanShadow.renderedEntities;
+					shadowBlockEntities += VulkanShadow.renderedBlockEntities;
 				} finally {
 					shadowActive = false;
 				}
