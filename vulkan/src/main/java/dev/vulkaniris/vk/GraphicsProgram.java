@@ -184,10 +184,24 @@ public final class GraphicsProgram implements AutoCloseable {
 
 	// ---- geometry recording: begin once, then many binds/draws, then end
 
-	/** Begins dynamic rendering into {@code colors} (+ optional {@code depth}), loading and storing their contents. */
+	/**
+	 * Begins dynamic rendering into {@code colors} (+ optional {@code depth}), loading and storing their contents. The
+	 * viewport is the first attachment's size; the render area and scissor are clamped to the smallest attachment
+	 * (GL draws into a framebuffer of mixed sizes clipped to their intersection, e.g. with a scaled colortex).
+	 */
 	public static void beginRendering(VkCommandBuffer cmd, GpuImage[] colors, GpuImage depth) {
 		GpuImage first = colors.length > 0 ? colors[0] : depth;
-		int w = first.width(), h = first.height();
+		int vw = first.width(), vh = first.height();
+		int aw = vw, ah = vh;
+		for (GpuImage c : colors) {
+			aw = Math.min(aw, c.width());
+			ah = Math.min(ah, c.height());
+		}
+		if (depth != null) {
+			aw = Math.min(aw, depth.width());
+			ah = Math.min(ah, depth.height());
+		}
+		final int w = aw, h = ah;
 		try (MemoryStack stack = stackPush()) {
 			VkRenderingAttachmentInfo.Buffer color = VkRenderingAttachmentInfo.calloc(Math.max(1, colors.length), stack);
 			for (int i = 0; i < colors.length; i++) {
@@ -205,7 +219,7 @@ public final class GraphicsProgram implements AutoCloseable {
 			if (cmd.getCapabilities().vkCmdBeginRendering != 0L) VK13.vkCmdBeginRendering(cmd, info);
 			else KHRDynamicRendering.vkCmdBeginRenderingKHR(cmd, info);
 			VkViewport.Buffer vp = VkViewport.calloc(1, stack);
-			vp.get(0).width(w).height(h).maxDepth(1f);
+			vp.get(0).width(vw).height(vh).maxDepth(1f);
 			vkCmdSetViewport(cmd, 0, vp);
 			VkRect2D.Buffer sc = VkRect2D.calloc(1, stack);
 			sc.get(0).extent(e -> e.set(w, h));

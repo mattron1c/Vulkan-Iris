@@ -516,7 +516,16 @@ final class PostChain implements AutoCloseable {
 
 		int[] formats = new int[RenderTargetSet.MAX_TARGETS];
 		for (int i : used) formats[i] = VkFormats.of(targetFormats[i]);
-		this.targets = new RenderTargetSet(alloc, destroyer, formats, width, height);
+		// Iris RenderTargets: each colortex at PackDirectives.getTextureScaleOverride (size.buffer.colortexN); a pass then
+		// renders at its draw buffers' size (GraphicsProgram.draw takes the first output's), as Iris's CompositeRenderer
+		this.targets = new RenderTargetSet(alloc, destroyer, formats, width, height, (i, w, h) -> {
+			org.joml.Vector2i v = directives.getTextureScaleOverride(i, w, h);
+			return new int[]{v.x, v.y};
+		});
+		for (int i : used) {
+			org.joml.Vector2i v = directives.getTextureScaleOverride(i, width, height);
+			if (v.x != width || v.y != height) notes.add("colortex" + i + " sized " + v.x + "x" + v.y + " for a " + width + "x" + height + " screen (size.buffer)");
+		}
 		if (needsCenterDepth) buildCenterDepth(compiler);
 
 		this.sceneCopy = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec("vulkaniris:scene-to-colortex0",
@@ -2369,7 +2378,10 @@ final class PostChain implements AutoCloseable {
 		directives.getExplicitFlips(st.preFlips()).forEach((b, flip) -> {
 			if (flip && targets.has(b)) targets.flip(b);
 		});
-		for (Pass p : list) run(p, mainColor, mainDepth);
+		for (Pass p : list) {
+			run(p, mainColor, mainDepth);
+			if (GpuTimer.PER_PASS) gpuMark(p.name);
+		}
 	}
 
 	/**

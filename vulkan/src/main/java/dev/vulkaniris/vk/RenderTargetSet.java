@@ -29,9 +29,22 @@ public final class RenderTargetSet implements AutoCloseable {
 	private final boolean[] flipped;
 	private int width, height;
 	private int generation;
+	private final Sizer sizer;
+
+	/** The size of colortex{index} for a {@code width} x {@code height} screen (Iris: size.buffer.colortexN). */
+	@FunctionalInterface
+	public interface Sizer {
+		int[] size(int index, int width, int height);
+	}
 
 	/** {@code formats[i]} = requested VkFormat for colortex{i}, or 0 when the pack doesn't use that target. */
 	public RenderTargetSet(GpuAllocator allocator, DeferredDestroyer destroyer, int[] formats, int width, int height) {
+		this(allocator, destroyer, formats, width, height, (i, w, h) -> new int[]{w, h});
+	}
+
+	/** As above; each target is {@code sizer}'s size for the screen size, which {@link #width()} / {@link #height()} keep. */
+	public RenderTargetSet(GpuAllocator allocator, DeferredDestroyer destroyer, int[] formats, int width, int height, Sizer sizer) {
+		this.sizer = sizer;
 		if (formats.length > MAX_TARGETS) throw new IllegalArgumentException("at most " + MAX_TARGETS + " colortex targets");
 		this.allocator = allocator;
 		this.destroyer = destroyer;
@@ -88,8 +101,10 @@ public final class RenderTargetSet implements AutoCloseable {
 			int usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 			// packs can bind colortex as image2D (imageLoad/imageStore) — only possible where the format supports storage
 			if ((optimalTilingFeatures(allocator.context(), fmt) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-			main[i] = allocator.createImage("colortex" + i, fmt, w, h, usage, VK_IMAGE_ASPECT_COLOR_BIT);
-			alt[i] = allocator.createImage("colortex" + i + "alt", fmt, w, h, usage, VK_IMAGE_ASPECT_COLOR_BIT);
+			int[] size = sizer.size(i, w, h);
+			int tw = Math.max(1, size[0]), th = Math.max(1, size[1]);
+			main[i] = allocator.createImage("colortex" + i, fmt, tw, th, usage, VK_IMAGE_ASPECT_COLOR_BIT);
+			alt[i] = allocator.createImage("colortex" + i + "alt", fmt, tw, th, usage, VK_IMAGE_ASPECT_COLOR_BIT);
 		}
 		width = w;
 		height = h;

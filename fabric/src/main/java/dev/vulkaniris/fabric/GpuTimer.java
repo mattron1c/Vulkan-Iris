@@ -28,9 +28,11 @@ import static org.lwjgl.vulkan.VK10.*;
  */
 final class GpuTimer implements AutoCloseable {
 	/** Opt-in, also in bench mode: the FPS numbers in BENCHMARK.md come from runs without it. */
-	static final boolean ENABLED = Boolean.getBoolean("vulkaniris.gputime");
+	static final boolean ENABLED = Boolean.getBoolean("vulkaniris.gputime") || "passes".equals(System.getProperty("vulkaniris.gputime"));
+	/** {@code -Dvulkaniris.gputime=passes}: also a mark after every program of the post stages. */
+	static final boolean PER_PASS = "passes".equals(System.getProperty("vulkaniris.gputime"));
 	private static final int RING = 8;
-	private static final int MARKS = 16;
+	private static final int MARKS = 96;
 
 	private final VulkanContext ctx;
 	private final FrameClock clock;

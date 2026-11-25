@@ -14,9 +14,11 @@ import java.util.Map;
  * is still in flight is not timed.
  */
 public final class GlStageTimer {
-	public static final boolean ENABLED = Boolean.getBoolean("vulkaniris.gputime");
+	public static final boolean ENABLED = Boolean.getBoolean("vulkaniris.gputime") || "passes".equals(System.getProperty("vulkaniris.gputime"));
+	/** {@code -Dvulkaniris.gputime=passes}: also a mark after every composite-stage program (Vulkan Iris addition). */
+	public static final boolean PER_PASS = "passes".equals(System.getProperty("vulkaniris.gputime"));
 	private static final int RING = 8;
-	private static final int MARKS = 16;
+	private static final int MARKS = 96;
 
 	private static int[] queries;
 	private static final String[][] labels = new String[RING][MARKS];

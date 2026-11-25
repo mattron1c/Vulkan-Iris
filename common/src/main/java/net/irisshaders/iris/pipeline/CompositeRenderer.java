@@ -301,6 +301,7 @@ public class CompositeRenderer {
 				Program.unbind();
 
 				if (compositePass instanceof ComputeOnlyPass) {
+					if (GlStageTimer.PER_PASS) GlStageTimer.mark(compositePass.name);
 					GLDebug.popGroup();
 					continue;
 				}
@@ -329,6 +330,7 @@ public class CompositeRenderer {
 				renderPass.drawIndexed(0, 0, 6, 1);
 
 				BlendModeOverride.restore();
+				if (GlStageTimer.PER_PASS) GlStageTimer.mark(compositePass.name);
 				GLDebug.popGroup();
 			}
 		}
