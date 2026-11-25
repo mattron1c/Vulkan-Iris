@@ -24,7 +24,7 @@ public final class DescriptorWrites implements AutoCloseable {
 	/** Combined image sampler, using the layout the image is in right now (call after the layout transitions). */
 	public DescriptorWrites image(int binding, int arrayElement, GpuImage img, long sampler) {
 		VkDescriptorImageInfo.Buffer ii = VkDescriptorImageInfo.calloc(1, stack);
-		ii.get(0).sampler(sampler).imageView(img.view()).imageLayout(img.layout());
+		ii.get(0).sampler(sampler).imageView(img.sampleView()).imageLayout(img.layout());
 		writes.get(n++).sType$Default().dstSet(set).dstBinding(binding).dstArrayElement(arrayElement).descriptorCount(1)
 			.descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(ii);
 		return this;

@@ -162,8 +162,26 @@ public final class GpuAllocator implements AutoCloseable {
 		bufferBytes.addAndGet(-buf.size());
 	}
 
+	/**
+	 * Gives a depth image a sampling view that reads (depth, depth, depth, 1), like the GL texture swizzle Iris sets on
+	 * its shadow maps (ShadowRenderer.configureDepthSampler). Attachments keep the identity view.
+	 */
+	public void addDepthSwizzleView(GpuImage img) {
+		if (img.external()) throw new IllegalArgumentException("refusing to add a view to external image " + img.name());
+		if (img.sampleView != 0L) return;
+		try (MemoryStack stack = stackPush()) {
+			LongBuffer p = stack.mallocLong(1);
+			VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default().image(img.image()).viewType(VK_IMAGE_VIEW_TYPE_2D)
+				.format(img.format()).subresourceRange(r -> r.aspectMask(img.aspect()).levelCount(1).layerCount(1))
+				.components(c -> c.r(VK_COMPONENT_SWIZZLE_R).g(VK_COMPONENT_SWIZZLE_R).b(VK_COMPONENT_SWIZZLE_R).a(VK_COMPONENT_SWIZZLE_ONE));
+			VkCheck.check(vkCreateImageView(ctx.device(), vci, null, p), "vkCreateImageView(" + img.name() + " depth swizzle)");
+			img.sampleView = p.get(0);
+		}
+	}
+
 	public void destroy(GpuImage img) {
 		if (img.external()) throw new IllegalArgumentException("refusing to destroy external image " + img.name());
+		if (img.sampleView != 0L) vkDestroyImageView(ctx.device(), img.sampleView, null);
 		vkDestroyImageView(ctx.device(), img.view(), null);
 		vmaDestroyImage(vma, img.image(), img.allocation());
 		imageBytes.addAndGet(-img.bytes());

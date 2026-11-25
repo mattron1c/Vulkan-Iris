@@ -175,6 +175,8 @@ fun registerProdSelfTest(name: String, flag: String) =
         jvmArgs.addAll("-Dorg.lwjgl.system.stackSize=256", "-D$flag=true")
         // e.g. gradlew :fabric:prodPhase6 -Dvulkaniris.phase6.packs=bsl,complementary
         System.getProperty("vulkaniris.phase6.packs")?.let { jvmArgs.add("-Dvulkaniris.phase6.packs=$it") }
+        // A/B: gradlew :fabric:prodPhase7 -Dvulkaniris.phase7.noshadow=true skips the shadow draws
+        System.getProperty("vulkaniris.phase7.noshadow")?.let { jvmArgs.add("-Dvulkaniris.phase7.noshadow=$it") }
         runDir.set(project.layout.projectDirectory.dir("run-prod"))
     }
 

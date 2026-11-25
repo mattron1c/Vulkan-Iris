@@ -28,8 +28,15 @@ public class IrisApiV0Impl implements IrisApi {
 		return 3;
 	}
 
+	/**
+	 * Vulkan Iris (fork addition): a pack is drawn by the Vulkan backend, which runs no GL pipeline. Other mods (Polydium's
+	 * occlusion culler, for one) ask this API whether a pack is in use, and must get the same answer they get on GL.
+	 */
+	public static volatile boolean vulkanPackInUse;
+
 	@Override
 	public boolean isShaderPackInUse() {
+		if (vulkanPackInUse) return true;
 		WorldRenderingPipeline pipeline = Iris.getPipelineManager().getPipelineNullable();
 
 		if (pipeline == null) {

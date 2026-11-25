@@ -39,6 +39,11 @@ import net.irisshaders.iris.gl.state.FogMode;
 import net.irisshaders.iris.shaderpack.programs.ProgramFallbackResolver;
 import net.irisshaders.iris.uniforms.builtin.BuiltinReplacementUniforms;
 import net.irisshaders.iris.vertices.sodium.terrain.FormatAnalyzer;
+import net.irisshaders.iris.compat.dh.DHCompat;
+import net.irisshaders.iris.shaderpack.properties.PackShadowDirectives;
+import net.irisshaders.iris.shadows.ShadowMatrices;
+import net.irisshaders.iris.shadows.ShadowRenderer;
+import net.minecraft.util.Mth;
 import org.joml.Matrix3f;
 import org.joml.Matrix4f;
 import net.irisshaders.iris.gl.texture.InternalTextureFormat;
@@ -258,6 +263,24 @@ final class PostChain implements AutoCloseable {
 	private final VulkanUniformWriter gbufferWriter = new VulkanUniformWriter();
 	private static final ProgramId[] TERRAIN_IDS = {ProgramId.TerrainSolid, ProgramId.TerrainCutout, ProgramId.Water};
 	private final Gbuffer[] terrain = new Gbuffer[3];
+	/** Iris SodiumPrograms' SHADOW / SHADOW_CUTOUT / SHADOW_TRANS passes (shadow_solid / _cutout / _water, falling back to shadow). */
+	private static final ProgramId[] SHADOW_IDS = {ProgramId.ShadowSolid, ProgramId.ShadowCutout, ProgramId.ShadowWater};
+	private final Gbuffer[] shadowTerrain = new Gbuffer[3];
+	/** Phase 7d: the pack has a shadow pass (Iris: shadow programs, and shadow.enabled not false). Decided before anything is built. */
+	private final boolean shadowPass;
+	private final PackShadowDirectives shadowDirectives;
+	private final int shadowResolution;
+	/** shadowtex0 (rendered into) and shadowtex1 (its copy before translucent shadow terrain); Iris ShadowRenderTargets. */
+	private GpuImage shadowDepth, shadowDepthNoTranslucent;
+	private final GpuImage[] shadowColor = new GpuImage[PackShadowDirectives.MAX_SHADOW_COLOR_BUFFERS_IRIS];
+	private List<Compute> shadowComposite = List.of();
+	/** While true, the terrain uniforms read the shadow view (Iris sets the shadow matrices into ChunkRenderMatrices). */
+	private boolean shadowing;
+	private final Matrix4f shadowModelView = new Matrix4f(), shadowProjection = new Matrix4f();
+	/** The resource being bound reads watershadow (Iris IrisSamplers: then "shadow" is shadowtex1, otherwise shadowtex0). */
+	private boolean bindingWaterShadow;
+	private boolean shadowBegun, shadowTranslucentCopied, prepareDone;
+	private long shadowFrames;
 	private ChunkVertexType vertexFormat = ChunkMeshFormats.COMPACT;
 	private final int mainDepthFormat;
 	private final boolean withGbuffers;
@@ -307,6 +330,12 @@ final class PostChain implements AutoCloseable {
 		this.set = set;
 		this.directives = set.getPackDirectives();
 		this.mainColorFormat = mainColorFormat;
+		this.shadowDirectives = directives.getShadowDirectives();
+		this.shadowResolution = shadowDirectives.getResolution();
+		// IrisRenderingPipeline: a ShadowRenderer exists when shadow.enabled isn't false; SodiumPrograms then draws
+		// terrain with the pack's shadow programs. Without a shadow program there is nothing to draw it with here.
+		this.shadowPass = withGbuffers && shadowDirectives.isShadowEnabled().orElse(true)
+			&& new ProgramFallbackResolver(set).resolveNullable(ProgramId.ShadowSolid) != null;
 
 		// IrisRenderingPipeline: the pack's id maps (block ids are read by uniforms like currentSelectedBlockId)
 		var idMap = set.getPack().getIdMap();
@@ -356,6 +385,7 @@ final class PostChain implements AutoCloseable {
 			buildTerrain(compiler, used);
 			// without terrain programs colortex0 gets the vanilla frame before deferred, which would overwrite pack entity draws
 			if (hasTerrain()) buildVanilla(compiler, used);
+			if (hasShadowPass()) buildShadowComposite(compiler, used);
 		}
 		for (Stage st : STAGES) {
 			flippedOnce = new HashSet<>(); // Iris: one CompositeRenderer per stage, each with its own flippedAtLeastOnce
@@ -533,6 +563,7 @@ final class PostChain implements AutoCloseable {
 	private List<GraphicsProgram.Binding> bindResources(String name, ShaderResourceLayout layout, TextureStage stage, Set<Integer> used,
 														Set<Integer> flippedOnce, int stageFlags, List<Bound> out) {
 		List<GraphicsProgram.Binding> bindings = new ArrayList<>();
+		bindingWaterShadow = layout.descriptors().stream().anyMatch(x -> x.name().equals("watershadow"));
 		for (ShaderResourceLayout.Descriptor desc : layout.descriptors()) {
 			int type = switch (desc.kind()) {
 				case UNIFORM_BUFFER -> VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -634,12 +665,13 @@ final class PostChain implements AutoCloseable {
 		gbufferWriter.override("gtextureSize", () -> new double[]{atlasWidth, atlasHeight});
 		gbufferWriter.override("gtextureId", () -> new double[]{0});
 		CapturedRenderingState s = CapturedRenderingState.INSTANCE;
-		gbufferWriter.override("iris_ModelViewMatrix", () -> mat4(new Matrix4f(s.getGbufferModelView())));
-		gbufferWriter.override("iris_ModelViewMatrixInverse", () -> mat4(new Matrix4f(s.getGbufferModelView()).invert()));
-		gbufferWriter.override("iris_ProjectionMatrix", () -> mat4(new Matrix4f(s.getGbufferProjection())));
-		gbufferWriter.override("iris_ProjectionMatrixInverse", () -> mat4(new Matrix4f(s.getGbufferProjection()).invert()));
+		// Iris ShadowRenderer: in the shadow pass Sodium's ChunkRenderMatrices hold the shadow view and projection
+		gbufferWriter.override("iris_ModelViewMatrix", () -> mat4(terrainModelView()));
+		gbufferWriter.override("iris_ModelViewMatrixInverse", () -> mat4(terrainModelView().invert()));
+		gbufferWriter.override("iris_ProjectionMatrix", () -> mat4(terrainProjection()));
+		gbufferWriter.override("iris_ProjectionMatrixInverse", () -> mat4(terrainProjection().invert()));
 		gbufferWriter.override("iris_NormalMatrix", () -> {
-			Matrix3f n = new Matrix4f(s.getGbufferModelView()).invert().transpose3x3(new Matrix3f());
+			Matrix3f n = terrainModelView().invert().transpose3x3(new Matrix3f());
 			float[] f = n.get(new float[9]);
 			double[] d = new double[9];
 			for (int i = 0; i < 9; i++) d[i] = f[i];
@@ -654,6 +686,14 @@ final class PostChain implements AutoCloseable {
 		gbufferWriter.attachCustom(customUniforms);
 	}
 
+	private Matrix4f terrainModelView() {
+		return shadowing ? new Matrix4f(shadowModelView) : new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferModelView());
+	}
+
+	private Matrix4f terrainProjection() {
+		return shadowing ? new Matrix4f(shadowProjection) : new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferProjection());
+	}
+
 	private static AlphaTest terrainAlpha(int kind, ProgramSource source) {
 		return source.getDirectives().getAlphaTestOverride().orElse(
 			kind == TerrainHook.TRANSLUCENT ? AlphaTests.NON_ZERO_ALPHA : kind == TerrainHook.CUTOUT ? AlphaTests.HALF_ALPHA : AlphaTest.ALWAYS);
@@ -666,21 +706,23 @@ final class PostChain implements AutoCloseable {
 	 */
 	private void buildTerrain(ShaderCompiler compiler, Set<Integer> used) {
 		ProgramFallbackResolver resolver = new ProgramFallbackResolver(set);
-		ProgramSource[] sources = new ProgramSource[3];
-		VulkanGlslTranslator.Result[] vk = new VulkanGlslTranslator.Result[3];
-		AlphaTest[] alpha = new AlphaTest[3];
+		// 0-2: gbuffers terrain solid / cutout / water; 3-5: shadow solid / cutout / water (Iris SodiumPrograms.Pass)
+		ProgramSource[] sources = new ProgramSource[6];
+		VulkanGlslTranslator.Result[] vk = new VulkanGlslTranslator.Result[6];
+		AlphaTest[] alpha = new AlphaTest[6];
 		boolean blockId = false, normal = false, midUv = false, midBlock = false;
-		for (int k = 0; k < 3; k++) {
-			ProgramSource src = resolver.resolveNullable(TERRAIN_IDS[k]);
+		for (int k = 0; k < (shadowPass ? 6 : 3); k++) {
+			ProgramSource src = resolver.resolveNullable(k < 3 ? TERRAIN_IDS[k] : SHADOW_IDS[k - 3]);
 			if (src == null || !src.isValid()) continue;
 			sources[k] = src;
 			if (src.getTessEvalSource().isPresent() || src.getTessControlSource().isPresent()) {
 				throw new IllegalStateException(src.getName() + ": tessellation in terrain programs (not implemented yet)");
 			}
-			alpha[k] = terrainAlpha(k, src);
+			alpha[k] = terrainAlpha(k % 3, src);
 			Map<PatchShaderType, String> gl = TransformPatcher.patchSodium(src.getName(), src.getVertexSource().orElse(null),
 				src.getGeometrySource().orElse(null), null, null, src.getFragmentSource().orElse(null), alpha[k], directives.getTextureMap());
 			vk[k] = VulkanGlslTranslator.translate(gl, gbufferWriter::provides, List.of("u_RegionOffset", "iris_CurrentTime"));
+			// Iris SodiumPrograms: the chunk format carries what any of its passes reads, shadow passes included
 			var a = vk[k].attributes();
 			blockId |= a.containsKey("mc_Entity");
 			normal |= a.containsKey("iris_Normal");
@@ -688,17 +730,21 @@ final class PostChain implements AutoCloseable {
 			midBlock |= a.containsKey("at_midBlock");
 		}
 		boolean any = false, all = true;
-		for (ProgramSource s : sources) {
-			any |= s != null;
-			all &= s != null;
+		for (int k = 0; k < 3; k++) {
+			any |= sources[k] != null;
+			all &= sources[k] != null;
 		}
 		if (!any) {
 			notes.add("pack has no terrain programs: terrain is drawn by Polydium and copied into colortex0");
+			if (shadowPass) notes.add("shadow pass skipped: the pack has shadow programs but no terrain programs (not implemented yet)");
 			return;
 		}
 		if (!all) {
 			// Polydium's own terrain pipeline reads Sodium's compact 20-byte vertices, so it can't draw the passes the pack leaves out
-			throw new IllegalStateException("pack has terrain programs for some passes only (" + Arrays.toString(sources) + "); not implemented yet");
+			throw new IllegalStateException("pack has terrain programs for some passes only (" + Arrays.toString(Arrays.copyOf(sources, 3)) + "); not implemented yet");
+		}
+		if (shadowPass && (sources[3] == null || sources[4] == null || sources[5] == null)) {
+			throw new IllegalStateException("pack has shadow programs for some terrain passes only (" + Arrays.toString(Arrays.copyOfRange(sources, 3, 6)) + "); not implemented yet");
 		}
 		vertexFormat = FormatAnalyzer.createFormat(blockId, normal, midUv, midBlock);
 		int stride = vertexFormat.getVertexFormat().getStride();
@@ -714,15 +760,17 @@ final class PostChain implements AutoCloseable {
 		if (midBlock) off += 4;
 		if (off != stride) throw new IllegalStateException("vertex stride " + stride + " != " + off + " computed from FormatAnalyzer's layout");
 
-		for (int k = 0; k < 3; k++) {
+		for (int k = 0; k < (shadowPass ? 6 : 3); k++) {
+			boolean shadow = k >= 3;
+			int kind = k % 3;
 			ProgramSource src = sources[k];
 			Gbuffer g = new Gbuffer();
 			g.name = src.getName();
 			g.alphaTest = alpha[k].reference();
 			var d = src.getDirectives();
-			// Iris SodiumPrograms.createFramebuffer: unknown draw buffers = {0}
-			g.drawBuffers = d.hasUnknownDrawBuffers() ? new int[]{0} : d.getDrawBuffers();
-			for (int b : g.drawBuffers) used.add(b);
+			// Iris SodiumPrograms.createFramebuffer: unknown draw buffers = {0} (gbuffers) or {0, 1} (shadow)
+			g.drawBuffers = d.hasUnknownDrawBuffers() ? (shadow ? new int[]{0, 1} : new int[]{0}) : d.getDrawBuffers();
+			if (!shadow) for (int b : g.drawBuffers) used.add(b);
 			g.layout = vk[k].layout();
 			for (String u : gbufferWriter.unresolved(g.layout)) notes.add(g.name + ": uniform " + u + " has no Vulkan value yet (zero)");
 			for (String u : List.of("blendFunc")) if (g.layout.uniforms().containsKey(u)) notes.add(g.name + ": uniform " + u + " reads GL blend state; written as 0");
@@ -740,11 +788,12 @@ final class PostChain implements AutoCloseable {
 					case FRAGMENT -> GraphicsProgram.Stage.FRAGMENT;
 					default -> throw new IllegalStateException(g.name + ": stage " + e.getKey() + " in a terrain program");
 				});
-				spirv.add(compiler.compile(g.name + e.getKey().extension, compilerStage(e.getKey()), e.getValue()));
+				spirv.add(compiler.compile(g.name + (shadow ? "_" + SHADOW_IDS[kind].name() : "") + e.getKey().extension, compilerStage(e.getKey()), e.getValue()));
 			}
 			List<GraphicsProgram.Attribute> attributes = new ArrayList<>();
 			for (var a : vk[k].attributes().entrySet()) {
 				int loc = a.getValue();
+				int kk = k;
 				attributes.add(switch (a.getKey()) {
 					// Sodium's compact vertex (DefaultChunkMeshAttributes)
 					case "a_Position" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R32G32_UINT, 0);
@@ -757,7 +806,7 @@ final class PostChain implements AutoCloseable {
 					case "mc_midTexCoord" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R16G16_USCALED, midUvOffset);
 					case "at_midBlock" -> new GraphicsProgram.Attribute(loc, VK_FORMAT_R8G8B8A8_SSCALED, midBlockOffset);
 					default -> throw new IllegalStateException(g.name + ": terrain program reads vertex attribute " + a.getKey() + ", which Sodium's chunk vertex doesn't have: "
-						+ vk[k].sources().get(PatchShaderType.VERTEX).lines().filter(l -> l.contains(a.getKey())).limit(6).toList());
+						+ vk[kk].sources().get(PatchShaderType.VERTEX).lines().filter(l -> l.contains(a.getKey())).limit(6).toList());
 				});
 			}
 
@@ -773,10 +822,11 @@ final class PostChain implements AutoCloseable {
 			int[] colorFormats = new int[g.drawBuffers.length];
 			GraphicsProgram.Blend[] blends = new GraphicsProgram.Blend[g.drawBuffers.length];
 			// Sodium's translucent pass blends like vanilla's translucent terrain; solid and cutout don't blend
-			GraphicsProgram.Blend base = k == TerrainHook.TRANSLUCENT ? GraphicsProgram.Blend.ALPHA : null;
+			GraphicsProgram.Blend base = kind == TerrainHook.TRANSLUCENT ? GraphicsProgram.Blend.ALPHA : null;
 			if (d.getBlendModeOverride().isPresent()) base = blend(d.getBlendModeOverride().get());
 			for (int i = 0; i < colorFormats.length; i++) {
-				colorFormats[i] = RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[g.drawBuffers[i]]));
+				colorFormats[i] = shadow ? shadowColorImage(g.drawBuffers[i]).format()
+					: RenderTargetSet.renderableFormat(ctx, VkFormats.of(targetFormats[g.drawBuffers[i]]));
 				blends[i] = base;
 			}
 			for (var info : d.getBufferBlendOverrides()) {
@@ -786,9 +836,10 @@ final class PostChain implements AutoCloseable {
 			}
 			if (d.getViewportScale() != null && d.getViewportScale().scale() != 1.0f) notes.add(g.name + ": viewport scale ignored (not implemented yet)");
 			// GL draws counter-clockwise front faces in GL window space; Polydium keeps GL's row order without a y flip,
-			// which mirrors the winding in Vulkan's framebuffer space, so GL's front faces are clockwise here
-			var raster = new GraphicsProgram.Raster(mainDepthFormat, true, true, VK_COMPARE_OP_LESS_OR_EQUAL, VK_CULL_MODE_BACK_BIT,
-				VK_FRONT_FACE_CLOCKWISE, g.pushSize);
+			// which mirrors the winding in Vulkan's framebuffer space, so GL's front faces are clockwise here.
+			// Iris ShadowRenderer disables backface culling for the whole shadow pass.
+			var raster = new GraphicsProgram.Raster(shadow ? VK_FORMAT_D32_SFLOAT : mainDepthFormat, true, true, VK_COMPARE_OP_LESS_OR_EQUAL,
+				shadow ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_CLOCKWISE, g.pushSize);
 			g.program = new GraphicsProgram(ctx.device(), new GraphicsProgram.Spec(g.name, stages, spirv, bindings, attributes, stride,
 				VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, colorFormats, blends, raster));
 			if (g.layout.uniformBufferSize() > 0) {
@@ -797,10 +848,30 @@ final class PostChain implements AutoCloseable {
 			}
 			Arrays.fill(g.slotSubmit, -1);
 			programCount++;
-			terrain[k] = g;
+			(shadow ? shadowTerrain : terrain)[kind] = g;
 		}
 		notes.add("terrain drawn with the pack's programs (" + terrain[0].name + ", " + terrain[1].name + ", " + terrain[2].name
 			+ "), vertex stride " + stride);
+		if (shadowPass) {
+			notes.add("shadow pass: terrain drawn with " + shadowTerrain[0].name + " / " + shadowTerrain[1].name + " / " + shadowTerrain[2].name
+				+ " into a " + shadowResolution + "x" + shadowResolution + " shadow map, shadow distance " + shadowDirectives.getDistance());
+		}
+	}
+
+	/** Iris ShadowCompositeRenderer: shadowcomp computes (fragment shadowcomp passes are reported, not drawn yet). */
+	private void buildShadowComposite(ShaderCompiler compiler, Set<Integer> used) {
+		for (ProgramSource src : set.getComposite(ProgramArrayId.ShadowComposite)) {
+			if (src != null && src.isValid()) notes.add(src.getName() + ": fragment shadowcomp programs are not drawn yet (not implemented yet)");
+		}
+		List<Compute> list = new ArrayList<>();
+		for (ComputeSource[] cs : set.getCompute(ProgramArrayId.ShadowComposite)) {
+			list.addAll(buildComputes(compiler, cs, TextureStage.SHADOWCOMP, used, Set.of()));
+		}
+		shadowComposite = list;
+		for (ComputeSource c : set.getShadowCompute()) {
+			if (c != null && c.getSource().isPresent()) notes.add(c.getName() + ": shadow compute programs (shadow.csh) are not run yet (not implemented yet)");
+		}
+		if (!list.isEmpty()) notes.add("shadowcomp: " + list.size() + " compute program(s) run after the shadow pass");
 	}
 
 	/** Iris BlendModeOverride (GL blend factors) as a Vulkan blend; OFF = no blending. */
@@ -1558,7 +1629,11 @@ final class PostChain implements AutoCloseable {
 			return new CenterDepth();
 		}
 		if (n.startsWith("shadow") || n.equals("watershadow")) {
-			notes.add(n + " bound to a 1x1 'no shadow' stand-in (shadow pass not implemented yet)");
+			if (shadowPass) {
+				Source s = shadowSource(pass, n, d);
+				if (s != null) return s;
+			}
+			notes.add(n + " bound to a 1x1 'no shadow' stand-in (" + (shadowPass ? "not implemented yet" : "the pack has no shadow pass on Vulkan") + ")");
 			return dummy(d.type(), 1f); // depth 1.0 = nothing occludes; colour 1.0 = untinted
 		}
 		CustomImage sampledImage = customImage(pass, n, true);
@@ -1930,10 +2005,10 @@ final class PostChain implements AutoCloseable {
 		}
 		clearTargets();
 
-		// begin and prepare: everything before the gbuffers
+		// begin here; prepare runs after the shadow pass (Iris: renderShadows, then prepareRenderer), see prepare()
+		prepareDone = false;
 		for (var e : passes.entrySet()) {
-			if (e.getKey().stage() == TextureStage.DEFERRED || e.getKey().stage() == TextureStage.COMPOSITE_AND_FINAL) continue;
-			runStage(e.getKey(), e.getValue());
+			if (e.getKey().stage() == TextureStage.BEGIN) runStage(e.getKey(), e.getValue());
 		}
 		endSegment();
 	}
@@ -1952,6 +2027,7 @@ final class PostChain implements AutoCloseable {
 	void beforeTranslucent(VkCommandBuffer cmd, LayoutTracker tracker) {
 		if (!levelBegun || translucentDone) throw new IllegalStateException("beforeTranslucent out of order");
 		segment(cmd, tracker);
+		ensurePrepared();
 		translucentDone = true;
 		if (!hasTerrain()) copyScene(mainColor);
 		if (depthNoTranslucent != null) copyDepth(mainDepth, depthNoTranslucent);
@@ -1977,6 +2053,7 @@ final class PostChain implements AutoCloseable {
 		if (!levelBegun) throw new IllegalStateException("endLevel without beginLevel");
 		if (!translucentDone) beforeTranslucent(cmd, tracker);
 		segment(cmd, tracker);
+		ensurePrepared();
 		for (var e : passes.entrySet()) {
 			if (e.getKey().stage() == TextureStage.COMPOSITE_AND_FINAL) runStage(e.getKey(), e.getValue());
 		}
@@ -2083,18 +2160,28 @@ final class PostChain implements AutoCloseable {
 	 */
 	void drawTerrain(VkCommandBuffer cmd, LayoutTracker tracker, int kind, List<RegionDraw> draws, TerrainInputs inputs) {
 		if (!levelBegun) throw new IllegalStateException("terrain drawn before beginLevel");
-		Gbuffer g = terrain[kind];
 		segment(cmd, tracker);
+		ensurePrepared();
 		terrainInputs = inputs;
 		atlasWidth = inputs.atlas().width();
 		atlasHeight = inputs.atlas().height();
+		Gbuffer g = terrain[kind];
 		GpuImage[] outs = new GpuImage[g.drawBuffers.length];
 		for (int i = 0; i < outs.length; i++) outs[i] = targets.read(g.drawBuffers[i]);
+		drawRegions(g, outs, mainDepthAttachment, draws);
+		endSegment();
+	}
+
+	/**
+	 * Draws one Sodium pass's region batches with {@code g} into {@code outs} + {@code depthAttachment}: one descriptor
+	 * set per region (its chunk data differs), region offset and time as push constants, then the batch as indexed draws.
+	 */
+	private void drawRegions(Gbuffer g, GpuImage[] outs, GpuImage depthAttachment, List<RegionDraw> draws) {
 		Resolved r = new Resolved(g.bounds, mainDepth);
 		for (GpuImage o : outs) {
 			if (r.storage.contains(o)) throw new IllegalStateException(g.name + " uses " + o.name() + " as a storage image and renders to it (not implemented)");
 			if (r.sampled.contains(o)) {
-				// GL feedback loop (the program samples the colortex it draws into). In practice GL returns what the buffer
+				// GL feedback loop (the program samples the target it draws into). In practice GL returns what the buffer
 				// held before the draw, except for texels the same draw already wrote; Vulkan forbids it outright, so the
 				// program samples a copy taken just before the pass instead
 				GpuImage copy = feedbackCopy(o);
@@ -2103,9 +2190,12 @@ final class PostChain implements AutoCloseable {
 				notes.add(g.name + ": samples " + o.name() + " while drawing into it (GL feedback loop); reads a copy taken before the pass");
 			}
 		}
+		if (r.sampled.contains(depthAttachment)) {
+			throw new IllegalStateException(g.name + " samples " + depthAttachment.name() + " while drawing into it (not implemented yet)");
+		}
 		r.declare(LayoutTracker.Use.SAMPLED_GRAPHICS, LayoutTracker.Use.STORAGE_FRAGMENT);
 		for (GpuImage o : outs) tracker.use(o, LayoutTracker.Use.COLOR_ATTACHMENT);
-		tracker.use(mainDepthAttachment, LayoutTracker.Use.DEPTH_ATTACHMENT);
+		tracker.use(depthAttachment, LayoutTracker.Use.DEPTH_ATTACHMENT);
 		tracker.flush(cmd);
 		if (g.usesSsbo) memoryBarrier();
 
@@ -2113,7 +2203,7 @@ final class PostChain implements AutoCloseable {
 		g.slotSubmit[slot] = clock.currentIndex();
 		CapturedRenderingState.INSTANCE.setCurrentAlphaTest(g.alphaTest);
 		boolean fill = true;
-		GraphicsProgram.beginRendering(cmd, outs, mainDepthAttachment);
+		GraphicsProgram.beginRendering(cmd, outs, depthAttachment);
 		try (MemoryStack s = MemoryStack.stackPush()) {
 			int stride = g.program.spec().vertexStride();
 			for (RegionDraw d : draws) {
@@ -2139,7 +2229,196 @@ final class PostChain implements AutoCloseable {
 			}
 		}
 		GraphicsProgram.endRendering(cmd);
+	}
+
+	// ------------------------------------------------------------------ 7d: shadow pass (Iris ShadowRenderer / ShadowRenderTargets)
+
+	/** True when the shadow terrain programs were built: the caller must then drive {@link #beginShadow} / {@link #endShadow}. */
+	boolean hasShadowPass() {
+		return shadowPass && shadowTerrain[0] != null;
+	}
+
+	int shadowResolution() {
+		return shadowResolution;
+	}
+
+	PackDirectives directives() {
+		return directives;
+	}
+
+	/**
+	 * Iris ShadowRenderer's voxelization guess: the shadow program has a geometry shader, or the shadow cutout program
+	 * uses images (IrisRenderingPipeline: ExtendedShader.hasActiveImages for SHADOW_TERRAIN_CUTOUT).
+	 */
+	boolean shadowVoxelization() {
+		if (!hasShadowPass()) return false;
+		boolean geometry = shadowTerrain[0].program.spec().stages().contains(GraphicsProgram.Stage.GEOMETRY);
+		boolean images = shadowTerrain[1].layout.descriptors().stream().anyMatch(x -> x.kind() == ShaderResourceLayout.Kind.IMAGE);
+		return geometry || images;
+	}
+
+	long shadowFrames() {
+		return shadowFrames;
+	}
+
+	/** shadowtex0 (0) and its pre-translucent copy shadowtex1 (1): DEPTH32 at the pack's shadowMapResolution. */
+	private GpuImage shadowDepthImage(int which) {
+		if (shadowDepth == null) {
+			shadowDepth = alloc.createImage("shadowtex0", VK_FORMAT_D32_SFLOAT, shadowResolution, shadowResolution,
+				VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+				VK_IMAGE_ASPECT_DEPTH_BIT);
+			shadowDepthNoTranslucent = alloc.createImage("shadowtex1", VK_FORMAT_D32_SFLOAT, shadowResolution, shadowResolution,
+				VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+			ownedImages.add(shadowDepth);
+			ownedImages.add(shadowDepthNoTranslucent);
+			// Iris ShadowRenderer.configureDepthSampler: shadow maps read (depth, depth, depth, 1) (old packs read .z)
+			alloc.addDepthSwizzleView(shadowDepth);
+			alloc.addDepthSwizzleView(shadowDepthNoTranslucent);
+			GpuImage a = shadowDepth, b = shadowDepthNoTranslucent;
+			uploads.add(() -> {
+				clearDepth(a, 1f);
+				clearDepth(b, 1f);
+			});
+		}
+		return which == 0 ? shadowDepth : shadowDepthNoTranslucent;
+	}
+
+	/** Iris ShadowRenderTargets.create: shadowcolorN in the pack's format, created when a program draws to or samples it. */
+	private GpuImage shadowColorImage(int index) {
+		if (index < 0 || index >= shadowColor.length) throw new IllegalStateException("shadowcolor" + index + " is past Iris's limit of " + shadowColor.length);
+		if (shadowColor[index] == null) {
+			PackShadowDirectives.SamplingSettings st = shadowDirectives.getColorSamplingSettings().computeIfAbsent(index, i -> new PackShadowDirectives.SamplingSettings());
+			int fmt = RenderTargetSet.renderableFormat(ctx, VkFormats.of(st.getFormat()));
+			GpuImage img = alloc.createImage("shadowcolor" + index, fmt, shadowResolution, shadowResolution,
+				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+				VK_IMAGE_ASPECT_COLOR_BIT);
+			ownedImages.add(img);
+			shadowColor[index] = img;
+			boolean integer = VkFormats.isInteger(st.getFormat());
+			// Iris: a new shadow target needs a full clear, whatever its clear setting
+			uploads.add(() -> clearColor(img, st.getClearColor(), integer));
+			if (st.getMipmap()) notes.add("shadowcolor" + index + ": mipmaps requested; sampled without mipmaps (not implemented yet)");
+		}
+		return shadowColor[index];
+	}
+
+	/** Iris IrisSamplers.addShadowSamplers / ShadowRenderTargets.getSamplerFor, for the samplers Vulkan Iris draws. */
+	private Source shadowSource(String pass, String n, ShaderResourceLayout.Descriptor d) {
+		String type = d.type().toLowerCase(Locale.ROOT);
+		int depth = switch (n) {
+			case "shadowtex0", "watershadow" -> 0;
+			case "shadowtex1" -> 1;
+			// with watershadow declared, "shadow" is the opaque-only map; otherwise it is shadowtex0
+			case "shadow" -> bindingWaterShadow ? 1 : 0;
+			default -> -1;
+		};
+		if (depth >= 0) {
+			PackShadowDirectives.DepthSamplingSettings ds = shadowDirectives.getDepthSamplingSettings().get(depth);
+			boolean compare = type.contains("shadow");
+			if (compare != ds.getHardwareFiltering()) {
+				// GL: compare mode comes from shadowHardwareFiltering, the result from the GLSL sampler type; a mismatch is
+				// undefined on GL. Vulkan needs the sampler to match the type, so the type decides
+				notes.add(pass + ": " + n + " is a " + d.type() + " but shadowHardwareFiltering" + depth + " = " + ds.getHardwareFiltering()
+					+ " (undefined on GL); sampled " + (compare ? "with" : "without") + " depth compare");
+			}
+			if (ds.getMipmap()) notes.add(n + ": mipmaps requested; sampled without mipmaps (not implemented yet)");
+			SamplerCache.Filter filter = ds.getNearest() ? SamplerCache.Filter.NEAREST : SamplerCache.Filter.LINEAR;
+			return new Fixed(shadowDepthImage(depth), new SamplerCache.Key(filter, SamplerCache.Address.CLAMP, false, compare));
+		}
+		int color = -1;
+		if (n.equals("shadowcolor")) color = 0;
+		else if (n.matches("shadowcolor\\d+")) color = Integer.parseInt(n.substring("shadowcolor".length()));
+		if (color >= 0) {
+			PackShadowDirectives.SamplingSettings st = shadowDirectives.getColorSamplingSettings().computeIfAbsent(color, i -> new PackShadowDirectives.SamplingSettings());
+			// Iris binds GlSampler.LINEAR (clamp); Vulkan can't filter integer formats linearly
+			return new Fixed(shadowColorImage(color), VkFormats.isInteger(st.getFormat()) ? SamplerCache.NEAREST_CLAMP : SamplerCache.LINEAR_CLAMP);
+		}
+		return null; // shadowtex0HW / shadowtex1HW / DH / shadowcolorimg: reported by the caller
+	}
+
+	/**
+	 * Iris ShadowRenderer.renderShadows, GPU side, start: the shadow view for this frame and IrisRenderingPipeline's
+	 * per-frame shadow clears (depth always, shadowcolors that clear).
+	 */
+	void beginShadow(VkCommandBuffer cmd, LayoutTracker tracker, Matrix4f modelView, Matrix4f projection) {
+		if (!levelBegun) throw new IllegalStateException("shadow pass before beginLevel");
+		if (!hasShadowPass()) throw new IllegalStateException("beginShadow without a shadow pass");
+		segment(cmd, tracker);
+		shadowModelView.set(modelView);
+		shadowProjection.set(projection);
+		clearDepth(shadowDepthImage(0), 1f);
+		for (int i = 0; i < shadowColor.length; i++) {
+			if (shadowColor[i] == null) continue;
+			PackShadowDirectives.SamplingSettings st = shadowDirectives.getColorSamplingSettings().get(i);
+			if (st != null && !st.getClear()) continue;
+			Vector4f c = st == null ? new Vector4f(1f) : st.getClearColor();
+			clearColor(shadowColor[i], c, st != null && VkFormats.isInteger(st.getFormat()));
+		}
+		shadowBegun = true;
+		shadowTranslucentCopied = false;
 		endSegment();
+	}
+
+	/** One Sodium terrain pass drawn from the shadow view with the pack's shadow program (Iris SodiumPrograms SHADOW*). */
+	void drawShadowTerrain(VkCommandBuffer cmd, LayoutTracker tracker, int kind, List<RegionDraw> draws, TerrainInputs inputs) {
+		if (!shadowBegun) throw new IllegalStateException("shadow terrain outside beginShadow / endShadow");
+		segment(cmd, tracker);
+		terrainInputs = inputs;
+		atlasWidth = inputs.atlas().width();
+		atlasHeight = inputs.atlas().height();
+		// Iris ShadowRenderer: shadowtex1 = the shadow depth before translucent terrain
+		if (kind == TerrainHook.TRANSLUCENT && !shadowTranslucentCopied) {
+			copyDepth(shadowDepth, shadowDepthNoTranslucent);
+			shadowTranslucentCopied = true;
+		}
+		Gbuffer g = shadowTerrain[kind];
+		GpuImage[] outs = new GpuImage[g.drawBuffers.length];
+		for (int i = 0; i < outs.length; i++) outs[i] = shadowColorImage(g.drawBuffers[i]);
+		shadowing = true;
+		try {
+			drawRegions(g, outs, shadowDepth, draws);
+		} finally {
+			shadowing = false;
+		}
+		endSegment();
+	}
+
+	/** End of Iris ShadowRenderer.renderShadows: the pre-translucent copy if translucent terrain wasn't drawn, then shadowcomp. */
+	void endShadow(VkCommandBuffer cmd, LayoutTracker tracker) {
+		if (!shadowBegun) throw new IllegalStateException("endShadow without beginShadow");
+		segment(cmd, tracker);
+		if (!shadowTranslucentCopied) copyDepth(shadowDepth, shadowDepthNoTranslucent);
+		shadowTranslucentCopied = true;
+		if (!shadowComposite.isEmpty()) {
+			// Iris ShadowCompositeRenderer: computes dispatched against the shadow map's size
+			for (Compute c : shadowComposite) dispatch(c, shadowResolution, shadowResolution);
+			memoryBarrier();
+		}
+		shadowBegun = false;
+		shadowFrames++;
+		endSegment();
+	}
+
+	/** Iris IrisRenderingPipeline.renderShadows ends with the prepare stage (after the shadow pass, if any). */
+	void prepare(VkCommandBuffer cmd, LayoutTracker tracker) {
+		if (!levelBegun) throw new IllegalStateException("prepare before beginLevel");
+		if (prepareDone) return;
+		segment(cmd, tracker);
+		ensurePrepared();
+		endSegment();
+	}
+
+	boolean prepareDone() {
+		return prepareDone;
+	}
+
+	/** Inside a segment: runs the prepare stage if the frame hasn't yet (a fallback if the shadow hook didn't run). */
+	private void ensurePrepared() {
+		if (prepareDone) return;
+		prepareDone = true;
+		for (var e : passes.entrySet()) {
+			if (e.getKey().stage() == TextureStage.PREPARE) runStage(e.getKey(), e.getValue());
+		}
 	}
 
 	private boolean slotFree(Pass p) {

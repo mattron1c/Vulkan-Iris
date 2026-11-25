@@ -28,8 +28,12 @@
     "MixinLevelRendererVulkan",
     "MixinLocalPlayerPort",
     "MixinRenderRegionArenasPort",
+    "MixinRenderRegionManagerShadowPort",
+    "MixinRenderRegionShadowPort",
     "MixinRenderSectionManagerPort",
+    "MixinRenderSectionManagerShadowPort",
     "MixinSodiumVulkanPort",
+    "MixinSodiumWorldRendererShadowPort",
     "MixinVulkanCommandEncoderPort",
     "MixinVulkanDeferralPort",
     "MixinVulkanRenderPassPort"

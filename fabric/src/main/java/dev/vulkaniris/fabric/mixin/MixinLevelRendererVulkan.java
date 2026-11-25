@@ -24,6 +24,14 @@ public class MixinLevelRendererVulkan {
 		PostChainCheck.beforeLevel();
 	}
 
+	/** Iris MixinLevelRenderer#iris$renderTerrainShadows: the shadow pass, then prepare, before the main terrain setup. */
+	@Inject(method = "renderLevel", at = @At(value = "INVOKE", shift = At.Shift.AFTER,
+		target = "Lnet/minecraft/client/renderer/LevelRenderer;prepareCullFrustum(Lorg/joml/Matrix4f;Lorg/joml/Matrix4f;Lnet/minecraft/world/phys/Vec3;)Lnet/minecraft/client/renderer/culling/Frustum;"))
+	private void vulkaniris$shadows(GraphicsResourceAllocator allocator, DeltaTracker deltaTracker, boolean bl, Camera camera, Matrix4f modelView,
+									Matrix4f projection, Matrix4f matrix4f3, GpuBufferSlice fog, Vector4f vector4f, boolean bl2, CallbackInfo ci) {
+		PostChainCheck.afterCullFrustum(camera);
+	}
+
 	@Inject(method = "renderLevel", at = @At("RETURN"))
 	private void vulkaniris$endLevel(GraphicsResourceAllocator allocator, DeltaTracker deltaTracker, boolean bl, Camera camera, Matrix4f modelView,
 									 Matrix4f projection, Matrix4f matrix4f3, GpuBufferSlice fog, Vector4f vector4f, boolean bl2, CallbackInfo ci) {

@@ -1,5 +1,8 @@
 package dev.vulkaniris.fabric;
 
+import net.irisshaders.iris.apiimpl.IrisApiV0Impl;
+import net.irisshaders.iris.shadows.ShadowRenderingState;
+import net.minecraft.client.Camera;
 import com.google.common.collect.ImmutableList;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.pipeline.RenderTarget;
@@ -374,6 +377,12 @@ public final class PostChainCheck {
 			line("vanilla: " + (VanillaHook.redirectedPasses() - vanillaPassesAtStart) + " Polydium world passes redirected; draws per pack program "
 				+ chain.vanillaDraws());
 			line("  hand passes (pre-hand depth copy + solid hand): " + handPasses);
+			if (chain.hasShadowPass()) {
+				line("shadow: " + shadowPasses + " shadow passes (" + chain.shadowResolution() + "x" + chain.shadowResolution() + "), "
+					+ shadowTerrainPasses + " shadow terrain passes drawn with the pack's shadow programs; culling: " + shadowCulling);
+			} else {
+				line("shadow: no shadow pass for this pack");
+			}
 			line("  vanilla draws seen while the pack was active: " + VanillaHook.takeSeen());
 			if (!chain.unmappedPipelines().isEmpty()) line("  vanilla pipelines with no Iris mapping (drawn by Polydium): " + new java.util.TreeSet<>(chain.unmappedPipelines()));		}
 		stopTerrain();
@@ -446,6 +455,11 @@ public final class PostChainCheck {
 		VanillaHook.sink = VANILLA_SINK;
 		handPasses = 0;
 		VulkanHand.enabled = VANILLA_SINK::active;
+		shadowPasses = 0;
+		shadowTerrainPasses = 0;
+		shadowFailed = false;
+		shadowCulling = "";
+		IrisApiV0Impl.vulkanPackInUse = true;
 		Minecraft.getInstance().levelRenderer.allChanged();
 		line("terrain programs active; chunks rebuilding in the pack's vertex format (stride "
 			+ chain.vertexFormat().getVertexFormat().getStride() + " bytes)");
@@ -454,6 +468,7 @@ public final class PostChainCheck {
 	private static void stopTerrain() {
 		VanillaHook.sink = null;
 		VulkanHand.enabled = () -> false;
+		IrisApiV0Impl.vulkanPackInUse = false;
 		if (TerrainHook.sink == null) return;
 		TerrainHook.sink = null;
 		WorldRenderingSettings.INSTANCE.setVertexFormat(ChunkMeshFormats.COMPACT);
@@ -473,6 +488,14 @@ public final class PostChainCheck {
 				PolydiumAccess.vkFormat(main.getDepthTexture()), main.width, main.height, VK_IMAGE_ASPECT_DEPTH_BIT, PolydiumAccess.TEXTURE_LAYOUT);
 			VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
 			PolydiumAccess.polydiumBarrier(cmd);
+			if (ShadowRenderingState.areShadowsCurrentlyBeingRendered()) {
+				// Iris SodiumPrograms: in the shadow pass Sodium's passes map to the shadow programs
+				if (!shadowActive) throw new IllegalStateException("Sodium drew terrain in shadow state outside Vulkan Iris's shadow pass");
+				chain.drawShadowTerrain(cmd, tracker, kind, draws, inputs);
+				PolydiumAccess.polydiumBarrier(cmd);
+				shadowTerrainPasses++;
+				return true;
+			}
 			if (!chain.levelBegun()) chain.beginLevel(cmd, tracker, color, depth, depthAttachment(main));
 			if (kind == TerrainHook.TRANSLUCENT && !chain.translucentDone()) chain.beforeTranslucent(cmd, tracker);
 			chain.drawTerrain(cmd, tracker, kind, draws, inputs);
@@ -558,6 +581,55 @@ public final class PostChainCheck {
 	}
 
 	private static long handPasses;
+
+	// ------------------------------------------------------------------ Phase 7d: shadow pass
+	private static boolean shadowActive, shadowFailed;
+	private static long shadowTerrainPasses, shadowPasses;
+	private static String shadowCulling = "";
+
+	/**
+	 * LevelRenderer.renderLevel after prepareCullFrustum (Iris MixinLevelRenderer#iris$renderTerrainShadows): the shadow
+	 * pass, then the prepare stage, as IrisRenderingPipeline.renderShadows does.
+	 */
+	public static void afterCullFrustum(Camera camera) {
+		if (chain == null || !chain.hasTerrain() || !chain.levelBegun() || PolydiumAccess.inRenderPass()) return;
+		try {
+			// -Dvulkaniris.phase7.noshadow=true: A/B switch; the shadow maps then stay cleared (depth 1 = nothing occludes)
+			if (chain.hasShadowPass() && !shadowFailed && !Boolean.getBoolean("vulkaniris.phase7.noshadow")) {
+				VulkanShadow.View view = VulkanShadow.view(chain.directives(), chain.shadowVoxelization());
+				shadowCulling = view.culling();
+				VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
+				PolydiumAccess.polydiumBarrier(cmd);
+				chain.beginShadow(cmd, tracker, view.modelView(), view.projection());
+				PolydiumAccess.polydiumBarrier(cmd);
+				shadowActive = true;
+				try {
+					VulkanShadow.drawTerrain(chain.directives(), view, camera, true);
+				} finally {
+					shadowActive = false;
+				}
+				cmd = PolydiumAccess.frameCommandBuffer();
+				PolydiumAccess.polydiumBarrier(cmd);
+				chain.endShadow(cmd, tracker);
+				PolydiumAccess.polydiumBarrier(cmd);
+				shadowPasses++;
+			}
+		} catch (Throwable t) {
+			shadowFailed = true;
+			allPassed = false;
+			Iris.logger.error("[Vulkan Iris] phase 7d shadow pass failed", t);
+			line("FAIL: shadow pass: " + t);
+		}
+		try {
+			VkCommandBuffer cmd = PolydiumAccess.frameCommandBuffer();
+			PolydiumAccess.polydiumBarrier(cmd);
+			chain.prepare(cmd, tracker);
+			PolydiumAccess.polydiumBarrier(cmd);
+		} catch (Throwable t) {
+			Iris.logger.error("[Vulkan Iris] phase 7 prepare failed", t);
+			fail("prepare: " + t);
+		}
+	}
 
 	private static GpuImage mainColor(RenderTarget main) {
 		return GpuImage.external("main colour", PolydiumAccess.vkImage(main.getColorTexture()),

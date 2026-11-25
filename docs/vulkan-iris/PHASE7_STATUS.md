@@ -209,3 +209,69 @@ Porting it on Polydium is not a contained change. The widened buffers would also
 fork doesn't redirect, such as GUI items, and those still expect vanilla's vertex layout. An ID per draw is not an
 option either: entities are batched by render type, so one draw holds many entities. Until this is ported, the
 attributes read GL's default (0,0,0,1) and every affected program says so in the notes.
+
+# Slice 7d — shadow pass (terrain)
+
+**Result:** in all 10 packs the shadow map is rendered with the pack's own `shadow` programs and read by its deferred,
+composite and gbuffers programs. `prodPhase7` passes **10 / 10**. Over 330 frames each pack runs 330 shadow passes
+with about 978 shadow terrain passes (Sodium's solid, cutout and translucent layers from the shadow view). Each pack
+uses its own `shadowMapResolution` (512 to 3072) and the shadow culling Iris would pick (Advanced or Safe Zone frustum
+culling, distance-capped). `prodPhase6` still passes 10 / 10, and `:vulkan:test` passes.
+
+| Complementary Reimagined | BSL | Noble without shadow draws (A/B) | Noble with shadows |
+|---|---|---|---|
+| ![Complementary](phase7/7d-complementary-reimagined.png) | ![BSL](phase7/7d-bsl.png) | ![Noble, no shadows](phase7/7d-noble-noshadow.png) | ![Noble](phase7/7d-noble.png) |
+
+The A/B images come from the same scene. Run with `-Dvulkaniris.phase7.noshadow=true`, the shadow maps stay cleared, so
+nothing occludes and the trunk and ground under the tree are lit. With the shadow pass they are shaded.
+
+## How it works
+- **When.** The hook is at `LevelRenderer.renderLevel`, right after `prepareCullFrustum`, Iris's own point
+  (`iris$renderTerrainShadows`). It runs the shadow pass and then the pack's `prepare` stage, as
+  `IrisRenderingPipeline.renderShadows` does. `begin` stays at `renderLevel` HEAD, so the frame order is the same as
+  Iris's: begin → shadow → shadowcomp → prepare → the world.
+- **View.** The shadow view comes from Iris's own code:
+  - `ShadowRenderer.createShadowModelView`
+  - `ShadowMatrices.createOrthoMatrix` (or `createPerspectiveMatrix` with `shadow.fov`)
+  - a port of `ShadowRenderer.createShadowFrustum` (`VulkanShadow`): non-culling, box, Advanced or Safe Zone
+    frustum, chosen the same way, including Iris's voxelization guess (a geometry shader or image stores in the shadow programs)
+- **Sections (CPU).** Iris's Sodium shadow mixins are ported unchanged as `*ShadowPort` (LGPL-3.0, credit: the Iris
+  team): `MixinRenderSectionManagerShadow`, `MixinRenderRegion`, `MixinRenderRegionManager` and the terrain part of
+  `MixinSodiumWorldRenderer`. Sodium keeps separate shadow render lists and batches while Iris's
+  `ShadowRenderingState` is set. With that state set, Vulkan Iris calls Sodium's public API the way Sodium's own
+  `LevelRenderer` mixin does: `setupTerrain` with the shadow frustum's viewport and the shadow
+  `ChunkRenderMatrices`, then `drawChunkLayer` for the opaque and translucent groups. Smart culling is off, as in Iris.
+  Nothing from Sodium or Polydium is copied.
+- **Draws (GPU).** Sodium's draws reach Polydium's `SodiumVulkan.draw` as usual. In shadow state, `TerrainHook` hands
+  them to the pack's shadow programs (Iris `SodiumPrograms`: `shadow_solid` / `_cutout` / `_water`, falling back to
+  `shadow`). The shadow programs are built and patched like the terrain programs (`patchSodium`). The chunk vertex
+  format now covers what the shadow programs read too, as in Iris. They draw into:
+  - `shadowtex0` (D32), at the pack's resolution, with no backface culling (Iris disables it in the shadow pass)
+  - the pack's `shadowcolorN`, in their formats; unknown draw buffers = {0, 1}, as in Iris
+- **Targets.**
+  - `shadowtex1` is copied from `shadowtex0` before translucent shadow terrain.
+  - Depth is cleared to 1 every frame, and `shadowcolorN` to its clear colour when it clears (Iris's per-frame shadow clears).
+  - Samplers follow Iris's `IrisSamplers.addShadowSamplers`: `shadow` is `shadowtex1` when the program declares
+    `watershadow`, else `shadowtex0`.
+  - `sampler2DShadow` gets a depth-compare sampler; the filter follows `shadowHardwareFiltering` / `shadowNearest`.
+  - Depth is sampled through a view that reads (depth, depth, depth, 1), Iris's GL texture swizzle.
+- **shadowcomp.** The packs' `shadowcomp` compute programs (BSL, Complementary Reimagined / Unbound, Bliss, Solas)
+  run after the shadow pass, dispatched against the shadow map's size as in Iris's `ShadowCompositeRenderer`.
+- **Polydium's occlusion culler.** It turns itself off when Iris's API reports a pack in use, which is what happens
+  with Iris on GL. Iris's GL pipeline never runs on Vulkan, so the fork's `IrisApiV0Impl.isShaderPackInUse` now also
+  reports a Vulkan pack (`vulkanPackInUse`). Without that, the camera-based culler would have filtered the shadow view's sections too.
+
+## Limits (all reported in the notes)
+- only terrain is drawn into the shadow map: entities, block entities and the player don't cast shadows yet
+  (Iris's shadow pass draws them with `shadow_entities` / `shadow_block`)
+- fragment `shadowcomp` programs and `shadow.csh` are reported, not run (none of the 10 packs has them)
+- shadow mipmaps (`shadowtex0Mipmap` etc.), `shadowtex0HW` / `shadowtex1HW` (separate hardware samplers) and
+  `shadowcolorimgN` storage images are not done
+- shadowcolor ping-pong (flipping between shadowcomp passes) is not implemented
+- a `sampler2D` on a shadow map with `shadowHardwareFiltering` set is undefined on GL; here the GLSL type decides
+  (no compare), and the notes say so (Complementary, Bliss)
+- the shadow pass is redrawn every frame, as Iris does
+
+## Found, not caused by 7d
+- **Noble's translucent hand is black.** The light-blue glass in the off hand renders black, with or without shadow draws.
+  It comes from the 7c-gaps hand pass, and is listed for the 7e correctness sweep.
