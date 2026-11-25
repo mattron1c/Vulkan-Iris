@@ -120,6 +120,7 @@ public final class PostChainCheck {
 	private static Bench bench;
 	private static boolean benchDone;
 	private static long benchVariants;
+	private static long benchBarriers, benchRedirected, benchClosedEmpty;
 
 	/** GameRenderer.render TAIL: world setup and timeouts. */
 	public static void afterGameRender() {
@@ -138,9 +139,15 @@ public final class PostChainCheck {
 				line((packIndex < 0 ? "bench (no pack: vanilla on Polydium Vulkan): " : "bench: ") + bench.result());
 				if (chain != null) line("  pipelines built on first use while measuring: " + (chain.variantsBuilt() - benchVariants)
 					+ " (slowest pipeline build of the pack: " + String.format("%.1f", chain.variantMaxNanos() / 1e6) + " ms)");
+				if (chain != null) line(String.format("  full barriers added by Vulkan Iris: %.1f per frame; redirected vanilla passes: %.1f per frame, %.1f closed without a resume",
+					(PolydiumAccess.barriers - benchBarriers) / (double) bench.frames(), (VanillaHook.redirectedPasses() - benchRedirected) / (double) bench.frames(),
+					(VanillaHook.closedEmpty - benchClosedEmpty) / (double) bench.frames()));
 				if (chain != null) line("  GPU stages: " + (chain.gpuTimer() == null ? "no timestamps on this queue" : chain.gpuTimer().report()));
 			} else if (!wasMeasuring && bench.measuring() && chain != null) {
 				benchVariants = chain.variantsBuilt();
+				benchBarriers = PolydiumAccess.barriers;
+				benchRedirected = VanillaHook.redirectedPasses();
+				benchClosedEmpty = VanillaHook.closedEmpty;
 				if (chain.gpuTimer() != null) chain.gpuTimer().reset();
 			}
 		}

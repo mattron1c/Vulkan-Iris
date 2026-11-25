@@ -105,6 +105,9 @@ public final class VanillaHook {
 	private VanillaHook() {
 	}
 
+	/** Passes closed through an attachment-less scope instead of a barrier and a resume (see close). */
+	static long closedEmpty;
+
 	static long redirectedPasses() {
 		return redirectedPasses;
 	}
@@ -280,8 +283,28 @@ public final class VanillaHook {
 		return true;
 	}
 
-	/** VulkanRenderPass.close HEAD: Polydium ends its scope next, so it must be open again. */
+	/**
+	 * VulkanRenderPass.close HEAD: Polydium ends its scope next (VulkanCommandEncoder.submitRenderPass: vkCmdEndRendering,
+	 * then its own full memory barrier), so a scope must be open. When the pass is suspended (its last draws were the
+	 * pack's), nothing more is drawn into Polydium's attachments, so the scope reopened for that end has no attachments.
+	 * It needs no barrier and doesn't load or store main colour / depth; Polydium's barrier after it orders the pack's
+	 * writes before the next pass.
+	 */
 	public static void close(VulkanRenderPass pass, VkCommandBuffer cmd, VulkanRenderPipeline pipeline, boolean hasDepth) {
+		Current cur = current;
+		if (cur != null && cur.pass == pass && cur.suspended) {
+			cur.suspended = false;
+			Sink s = sink;
+			if (s != null) s.end(cmd);
+			try (MemoryStack stack = MemoryStack.stackPush()) {
+				VkRenderingInfo info = VkRenderingInfo.calloc(stack).sType$Default()
+					.renderArea(r -> r.offset(o -> o.set(cur.x, cur.y)).extent(x -> x.set(Math.max(1, cur.w), Math.max(1, cur.h)))).layerCount(1);
+				if (cmd.getCapabilities().vkCmdBeginRendering != 0L) VK13.vkCmdBeginRendering(cmd, info);
+				else KHRDynamicRendering.vkCmdBeginRenderingKHR(cmd, info);
+				VulkanDynamicState.reset();
+			}
+			closedEmpty++;
+		}
 		resume(pass, cmd, pipeline, hasDepth);
 		if (current != null && current.pass == pass) current = null;
 		if (sink != null) {

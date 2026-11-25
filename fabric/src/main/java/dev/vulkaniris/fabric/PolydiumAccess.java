@@ -91,7 +91,11 @@ final class PolydiumAccess {
 		};
 	}
 
+	/** Full barriers Vulkan Iris added to the frame command buffer (bench diagnostics). */
+	static long barriers;
+
 	static void polydiumBarrier(VkCommandBuffer cmd) {
+		barriers++;
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			VulkanCommandEncoder.memoryBarrier(cmd, stack);
 		}

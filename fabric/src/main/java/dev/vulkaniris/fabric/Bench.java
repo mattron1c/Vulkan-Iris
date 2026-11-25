@@ -31,6 +31,11 @@ final class Bench {
 		return warmStart >= 0;
 	}
 
+	/** Frames measured so far. */
+	int frames() {
+		return Math.max(1, count);
+	}
+
 	boolean measuring() {
 		return measureStart >= 0 && measureEnd < 0;
 	}
