@@ -26,7 +26,7 @@ Instead of wrapping OpenGL, it borrows the Vulkan device of the renderer that ow
 Tested so far on an NVIDIA RTX 5060 (driver 610.88), Minecraft 1.21.11, Fabric, Polydium 1.4.21.
 
 **Performance:** [A/B benchmark against Iris on GL](docs/vulkan-iris/BENCHMARK.md), same jar and scene. Vulkan Iris is
-faster in 5 of 10 packs and slower in 5, so it is not faster than Iris overall yet. GPU per-stage times aren't measured yet.
+faster in 6 of 10 packs (average FPS) and slower in 4, so it is not faster than Iris overall yet. Per-stage GPU times on both sides show where it loses.
 
 AMD, Intel and integrated GPUs are targets, but **have not been tested yet**.
 

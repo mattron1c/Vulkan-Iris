@@ -37,8 +37,8 @@ renders the shadow maps. Once that works, packs render as they do on Iris and pe
    - *Done:* `at_tangent` / `mc_midTexCoord` derived per quad in the vertex shader (Noble's black glass), see [PHASE7_STATUS.md](PHASE7_STATUS.md#slice-7e--derived-at_tangent--mc_midtexcoord).
 
 ## Performance — how it will be measured (no claim until measured)
-**Measured:** see [BENCHMARK.md](BENCHMARK.md). In short, B is faster in 5 packs and slower in 5; the 30–68 ms
-frame spikes of the first run were Vulkan Iris's own WeakHashMaps and are fixed. GPU per-stage times are not measured yet.
+**Measured:** see [BENCHMARK.md](BENCHMARK.md). In short, B has higher average FPS in 6 packs and lower in 4.
+Per-stage GPU times on both sides show where: translucent terrain and the opaque world.
 
 Being "faster than Iris" can only be shown once both render the same frame, after 7b–7d. Method:
 - **Same scene.** World `vulkaniris-phase6` (seed 6), a fixed camera and fixed time, the same pack and options, the same resolution, VSync off.

@@ -33,7 +33,44 @@ No performance claim about Vulkan Iris is made without these numbers. Where Vulk
 - **GPU time per stage on GL:** the same flag on `prodBenchGl` (`GlStageTimer` in Iris's pipeline).
 - Packs run one after another in one game session per side, in the same order. A and B never run at the same time.
 
-## Results — 2026-11-24, NVIDIA RTX 5060 (driver 610.88), after the frame-spike fix
+## Results — 2026-11-25, NVIDIA RTX 5060 (driver 610.88), current
+B with every fix below: the frame-spike fix, Iris's shadow-pass rule, `size.buffer`, and fewer barriers. A is the
+first GL run (2026-11-24). Two later GL runs were within ±5 % of it in average FPS, pack by pack. One B run, 60 s per
+pack after a 20 s warm-up.
+
+| pack | A average FPS | B average FPS | Δ average | A 1 % low | B 1 % low | Δ 1 % low | A / B worst frame |
+|---|---|---|---|---|---|---|---|
+| *no pack (shaders off): the backend alone* | 1065 | 2705 | +154 % | 453 | 516 | +14 % | 12.8 / 30.0 ms |
+| Bliss | 423 | 486 | +15 % | 255 | 259 | +2 % | 9.7 / 10.9 ms |
+| BSL | 415 | 389 | −6 % | 265 | 234 | −12 % | 8.5 / 8.2 ms |
+| Complementary Reimagined | 412 | 370 | −10 % | 250 | 196 | −22 % | 8.2 / 16.1 ms |
+| Complementary Unbound | 414 | 349 | −16 % | 257 | 199 | −23 % | 9.7 / 10.0 ms |
+| MakeUp UltraFast | 586 | 823 | +40 % | 333 | 310 | −7 % | 8.5 / 12.9 ms |
+| Mellow | 836 | 1322 | +58 % | 430 | 428 | −1 % | 11.2 / 11.6 ms |
+| miniature | 569 | 1123 | +97 % | 313 | 407 | +30 % | 11.4 / 11.7 ms |
+| Noble | 269 | 302 | +13 % | 189 | 203 | +8 % | 8.4 / 9.6 ms |
+| Sildur's Vibrant Extreme | 389 | 458 | +18 % | 228 | 258 | +13 % | 11.4 / 15.1 ms |
+| Solas | 338 | 293 | −13 % | 220 | 195 | −11 % | 8.3 / 19.6 ms |
+
+- **Average FPS:**
+  - Higher on B in 6 packs: miniature +97 %, Mellow +58 %, MakeUp +40 %, Sildur's +18 %, Bliss +15 %, Noble +13 %.
+  - Lower in 4: Complementary Unbound −16 %, Solas −13 %, Complementary Reimagined −10 %, BSL −6 %.
+- **1 % lows:**
+  - Higher on B in 3 packs: miniature +30 %, Sildur's +13 %, Noble +8 %.
+  - About even in 2: Bliss +2 %, Mellow −1 %.
+  - Lower in 5: Complementary −22 / −23 %, BSL −12 %, Solas −11 %, MakeUp −7 %.
+  - B's 1 % lows vary more between runs than A's. The no-pack control's 1 % low was 745 in one B run and 516 in
+    this one, with the same code path. So single-run 1 % low differences under about 15 % aren't conclusive.
+- **What changed since the first run:**
+  - Noble −27 % → +13 % (`size.buffer`).
+  - Mellow +25 % → +58 % (no extra shadow pass).
+  - Worst frames 30–68 ms → 8–20 ms (WeakHashMap purge).
+- **Where B still loses** (stage tables below):
+  - translucent terrain: BSL's `gbuffers_water` takes 0.55 ms on B, against 0.14 ms for GL's whole translucent window;
+    the cause isn't found yet
+  - the opaque world: up to +0.5 ms in Complementary and Solas
+
+## Earlier result — 2026-11-24, after the frame-spike fix
 
 A = Iris 1.10.8 on GL (Sodium 0.8). B = Vulkan Iris on Polydium 1.4.21 (Vulkan 1.4.341). 60 s per pack after a 20 s
 warm-up; the scene, options and order are the same on both sides. "Δ" is B against A. A is the run below (unchanged
@@ -53,8 +90,8 @@ code on the GL side); B was re-run after the fix described in [Frame-time spikes
 | Sildur's Vibrant Extreme | 389 | 433 | +11 % | 228 | 266 | +17 % | 11.4 / 7.2 ms |
 | Solas | 338 | 283 | −16 % | 220 | 185 | −16 % | 8.3 / 14.3 ms |
 
-### What this shows, and what it doesn't
-- **Vulkan Iris is not faster than Iris overall.** It depends on the pack.
+### What that run showed
+- **Vulkan Iris was not faster than Iris overall.** It depends on the pack.
   - Average FPS is higher in 5 packs (+11 % to +85 %) and lower in 5 (−8 % to −29 %).
   - 1 % lows are higher in 5 packs (+7 % to +31 %) and lower in 5 (−7 % to −23 %).
   - Worst frames are now 7–23 ms on B, against 8–13 ms on A. B no longer has the 30–68 ms spikes of the first run.
@@ -169,6 +206,34 @@ except Noble (+0.25) and Sildur's (+0.02).
 - **Result:** Mellow now has no shadow pass, as on GL. The other 9 packs keep theirs, as on GL. The report names the
   programs and samplers that keep each pack's shadow pass on. prodPhase7 11/11, prodPhase6 10/10.
 - The FPS tables above were measured before this fix, so Mellow's B numbers include that extra shadow pass.
+
+## Fixed: `size.buffer` (scaled colortex) was ignored — Noble
+- **Found with per-pass GPU timing** (`-Dvulkaniris.gputime=passes`, both sides). Noble's `deferred1` took 1.24 ms on B
+  against 0.04 ms on A, and `deferred2` 0.75 against 0.32 ms.
+- **Cause.** Noble sets `size.buffer.colortex6 = 0.1` and colortex7, 12 and 14 to 0.5.
+  - Iris's `RenderTargets` sizes each target by `PackDirectives.getTextureScaleOverride`, and a pass renders at its draw
+    buffers' size.
+  - B allocated every colortex at screen size, so those passes shaded up to 100× the pixels.
+- **Fix.**
+  - `RenderTargetSet` takes a per-target sizer, and `PostChain` passes Iris's.
+  - Post passes already render at their first output's size, as Iris's `CompositeRenderer` does.
+  - `beginRendering` clamps the render area to the smallest attachment, as GL clips to the framebuffer intersection.
+- **Result.** Noble's `deferred1` is 0.04 ms, and its average FPS went from 196 to 302 (+54 %). Complementary
+  Reimagined and Unbound scale colortex1 and colortex7 to 0.5 and also use this now.
+
+## Fewer barriers
+- **Count.** B added about 70 full pipeline barriers per frame, two for each of the ~25 redirected Polydium passes:
+  - one where Polydium's draws hand over to the pack's
+  - one where they hand back, to resume Polydium's rendering scope
+- **The second one was redundant when the pass closes right after.** Polydium's `submitRenderPass` ends the scope and
+  then always records its own full barrier.
+- **Fix.** Such a pass is now closed through an attachment-less scope: no barrier, and no load or store of main colour
+  and depth.
+- **Result.**
+  - About 47–52 barriers per frame now.
+  - BSL's GPU frame went from 2.63 to 2.53 ms (Complementary Unbound 2.90 → 2.81, Solas 3.53 → 3.25; one 30 s run each).
+  - The handover barrier is still a full one. A narrower one, covering only the depth attachment both sides write, is
+    the next thing to try.
 
 ## Frame-time spikes: found and fixed
 The first run (below) had a 20–68 ms frame every 2–3 s on B, in every pack, and none in the no-pack control.
